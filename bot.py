@@ -29,9 +29,9 @@ class BookingState(StatesGroup):
 # ══════════════════════════════════════════════
 #  НАСТРОЙКИ / ПОДКЛЮЧЕНИЯ
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+GOOGLE_SHEET_URL  = os.getenv("GOOGLE_SHEET_URL")
 GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "google_creds.json")
 
 if not GOOGLE_SHEET_URL:
@@ -66,6 +66,7 @@ EVENTS_CONFIG = {
         "sheet": "Нутрициолог", "duration": 90, "capacity": 30,
         "start": "15:00", "end": "16:30",
         "desc": "🥗 **Нутрициолог** — лекция о женском здоровье и энергии (Зал совещаний, 5 этаж).",
+        "fixed_time": "15:00",
     },
     "массаж": {
         "sheet": "Массаж", "duration": 10, "capacity": 3,
@@ -80,6 +81,18 @@ EVENTS_CONFIG = {
             "   • Юлия — переговорка 614а\n"
             "   • Натэлла — переговорка №3, 1 этаж"
         ),
+    },
+    "мастерская чехова": {
+        "sheet": "Мастерская Чехова", "duration": 60, "capacity": 10,
+        "start": "11:00", "end": "17:00",
+        "custom_slots": ["11:00", "12:00", "14:00", "15:00", "16:00"],
+        "desc": "🎨 **Мастерская Чехова** — создайте свою картину в винтажном гипсовом багете!",
+    },
+    "семейный нутрициолог": {
+        "sheet": "Семейный нутрициолог", "duration": 90, "capacity": 30,
+        "start": "15:00", "end": "16:30",
+        "desc": "👨‍👩‍👧 **Семейный нутрициолог** — лекция о правильном питании для всей семьи (15:00–16:30).",
+        "fixed_time": "15:00",
     },
 }
 
@@ -119,18 +132,37 @@ EVENT_ALIASES = {
     "мэйкап": "макияж", "мейкап": "макияж",
     "психолог": "аромапсихолог", "арома": "аромапсихолог",
     "нутрицеолог": "нутрициолог", "нутрициолуг": "нутрициолог",
+    # ── новые ──
+    "мастерская": "мастерская чехова", "чехов": "мастерская чехова",
+    "чехова": "мастерская чехова", "багет": "мастерская чехова",
+    "картина": "мастерская чехова",
+    "семейный": "семейный нутрициолог",
+    "сем нутрициолог": "семейный нутрициолог",
+    "семейный нутрицеолог": "семейный нутрициолог",
 }
 
 
 # ══════════════════════════════════════════════
-#  СКЛОНЕНИЯ РУССКОГО ЯЗЫКА
+#  СКЛОНЕНИЯ / ИКОНКИ
 # ══════════════════════════════════════════════
 EVENT_FORMS = {
-    "аромапсихолог": {"to": "к аромапсихологу",  "at": "у аромапсихолога",  "acc": "аромапсихолога",  "title": "Аромапсихолог"},
-    "макияж":        {"to": "на макияж",          "at": "на макияж",         "acc": "макияж",          "title": "Макияж"},
-    "нутрициолог":   {"to": "к нутрициологу",     "at": "у нутрициолога",    "acc": "нутрициолога",    "title": "Нутрициолог"},
-    "массаж":        {"to": "на массаж",          "at": "на массаж",         "acc": "массаж",          "title": "Массаж"},
-    "гадалки":       {"to": "к гадалке",          "at": "у гадалок",         "acc": "гадалок",         "title": "Гадалки"},
+    "аромапсихолог":        {"to": "к аромапсихологу",          "at": "у аромапсихолога",          "acc": "аромапсихолога",          "title": "Аромапсихолог"},
+    "макияж":               {"to": "на макияж",                 "at": "на макияж",                 "acc": "макияж",                  "title": "Макияж"},
+    "нутрициолог":          {"to": "к нутрициологу",            "at": "у нутрициолога",            "acc": "нутрициолога",            "title": "Нутрициолог"},
+    "массаж":               {"to": "на массаж",                 "at": "на массаж",                 "acc": "массаж",                  "title": "Массаж"},
+    "гадалки":              {"to": "к гадалке",                 "at": "у гадалок",                 "acc": "гадалок",                 "title": "Гадалки"},
+    "мастерская чехова":    {"to": "в Мастерскую Чехова",       "at": "в Мастерской Чехова",       "acc": "Мастерскую Чехова",       "title": "Мастерская Чехова"},
+    "семейный нутрициолог": {"to": "к семейному нутрициологу",  "at": "у семейного нутрициолога",  "acc": "семейного нутрициолога",  "title": "Семейный нутрициолог"},
+}
+
+EVENT_ICONS = {
+    "аромапсихолог": "🌸",
+    "макияж": "💄",
+    "нутрициолог": "🥗",
+    "массаж": "💆‍♀️",
+    "гадалки": "🔮",
+    "мастерская чехова": "🎨",
+    "семейный нутрициолог": "👨‍👩‍👧",
 }
 
 
@@ -178,33 +210,38 @@ def get_lock(event: str) -> asyncio.Lock:
 async def parse_intent(text: str) -> dict:
     prompt = f"""
 Ты заботливый бот-ассистент для записи девушек на корпоративные мероприятия. 
-Доступные мероприятия: аромапсихолог, макияж, нутрициолог, массаж, гадалки.
+Доступные мероприятия (СТРОГО одно из этих значений для event):
+  аромапсихолог, макияж, нутрициолог, массаж, гадалки, мастерская чехова, семейный нутрициолог
+
+ВАЖНО: «нутрициолог» и «семейный нутрициолог» — РАЗНЫЕ мероприятия!
+- «нутрициолог», «лекция нутрициолога» → event = "нутрициолог"
+- «семейный нутрициолог», «семейный» → event = "семейный нутрициолог"
+
+«мастерская», «мастерская Чехова», «картина», «багет» → event = "мастерская чехова"
 
 Известные специалисты:
 - Гадалки: Юлия, Натэлла
 - Массаж: Виктор, Нарек, Ольга
 
 Определи намерение пользователя. Возможные действия (action):
-- "book" (запись — включая случаи, когда пользователь просто пишет название услуги: «массаж», «хочу на массаж», «гадалки»)
+- "book" (запись — включая случаи, когда пользователь просто пишет название услуги)
 - "cancel" (отмена записи)
 - "reschedule" (перенос записи на другое время)
 - "availability" (вопрос о свободных местах/слотах)
-- "info" (ТОЛЬКО если пользователь ЯВНО просит рассказать/описать/узнать подробности об услуге. Примеры: «расскажи про массаж», «что за услуги?», «какие активности есть?», «подробнее о макияже», «что вы предлагаете?»)
-- "my_bookings" (просьба показать все свои записи)
+- "info" (ТОЛЬКО если пользователь ЯВНО просит описание/подробности)
+- "my_bookings" (показать свои записи / программу / расписание)
 
 КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-1. Если пользователь просто пишет название услуги («массаж», «гадалки», «макияж», «нутрициолог») — это action="book", НЕ "info"!
-2. action="info" — ТОЛЬКО при явной просьбе узнать подробности/описание (слова: «расскажи», «что такое», «подробнее», «информация», «какие услуги»).
-3. Если пользователь пишет что-то вроде «хочу массаж», «давай на массаж», «можно на массаж» — это "book".
-4. Извлеки название мероприятия, время и предпочтительного мастера.
-5. Если это нутрициолог, время всегда 15:00.
-6. Если action это cancel, availability, info или my_bookings — time может быть null.
-7. preferred_master — имя мастера/гадалки, если пользователь ЯВНО указал (напр. «к Юлии»). Иначе null.
-8. Если event не указан при action="info", поставь event=null (пользователь спрашивает обо всех услугах).
-9. Если текст не относится к услугам и не является приветствием, верни null для всех полей.
+1. Просто название услуги («массаж», «мастерская») — action="book", НЕ "info"!
+2. action="info" — ТОЛЬКО при словах «расскажи», «что такое», «подробнее», «какие услуги».
+3. «моя программа», «мой план», «расписание», «куда записана» — "my_bookings".
+4. Если нутрициолог (любой) — time всегда 15:00.
+5. preferred_master — имя мастера/гадалки, если ЯВНО указано. Иначе null.
+6. Если event не указан при info → event=null.
+7. Если текст не относится к услугам → null для всех полей.
 
 Ответь ТОЛЬКО валидным JSON:
-{{"action":"...","event":"СТРОГО ОДНО ИЗ: аромапсихолог, макияж, нутрициолог, массаж, гадалки или null","time":"HH:MM или null","preferred_master":"имя или null"}}
+{{"action":"...","event":"СТРОГО ОДНО ИЗ: аромапсихолог, макияж, нутрициолог, массаж, гадалки, мастерская чехова, семейный нутрициолог или null","time":"HH:MM или null","preferred_master":"имя или null"}}
 
 Текст: {text}
 """
@@ -270,22 +307,68 @@ def count_available_masters(event, time_str, bookings_at_time, preferred_name=No
     return count
 
 
-def is_valid_slot_time(event: str, time_str: str) -> tuple:
+def get_slot_list(event: str) -> list:
+    """
+    Возвращает упорядоченный список допустимых слотов.
+    Поддерживает custom_slots, fixed_time и обычный start/end/duration.
+    """
     config = EVENTS_CONFIG[event]
-    if event == "нутрициолог":
-        return (True, None) if time_str == "15:00" else (
-            False, "Лекция нутрициолога начинается строго в **15:00** 🕒"
+
+    # Фиксированное время (нутрициолог, семейный нутрициолог)
+    if "fixed_time" in config:
+        return [config["fixed_time"]]
+
+    # Явный список слотов (мастерская Чехова)
+    if "custom_slots" in config:
+        return list(config["custom_slots"])
+
+    # Обычная генерация по интервалу
+    start_dt = datetime.strptime(config["start"], "%H:%M")
+    end_dt   = datetime.strptime(config["end"],   "%H:%M")
+    delta    = timedelta(minutes=config["duration"])
+    slots = []
+    cur = start_dt
+    while cur < end_dt:
+        slots.append(cur.strftime("%H:%M"))
+        cur += delta
+    return slots
+
+
+def is_valid_slot_time(event: str, time_str: str) -> tuple:
+    """Проверяет, что время попадает в допустимые слоты."""
+    config = EVENTS_CONFIG[event]
+    valid_slots = get_slot_list(event)
+
+    if time_str in valid_slots:
+        return True, None
+
+    # Формируем сообщение об ошибке
+    if "fixed_time" in config:
+        ft = config["fixed_time"]
+        return False, (
+            f"**{ef(event)}** начинается строго в **{ft}** 🕒"
         )
+
+    if "custom_slots" in config:
+        slots_str = ", ".join(valid_slots)
+        return False, (
+            f"⏰ **{ef(event)}** — доступные сеансы: **{slots_str}**.\n"
+            f"Пожалуйста, выберите один из них!"
+        )
+
+    # Обычная проверка рабочих часов
     start_dt = datetime.strptime(config["start"], "%H:%M")
     end_dt   = datetime.strptime(config["end"],   "%H:%M")
     req_dt   = datetime.strptime(time_str, "%H:%M")
+
     if req_dt < start_dt or req_dt >= end_dt:
         return False, (
             f"⏰ **{ef(event)}** работает с {config['start']} до {config['end']}.\n"
             f"Пожалуйста, выберите время в этом диапазоне!"
         )
-    mins = int((req_dt - start_dt).total_seconds() / 60)
+
     dur  = config["duration"]
+    mins = int((req_dt - start_dt).total_seconds() / 60)
     if mins % dur != 0:
         prev = start_dt + timedelta(minutes=(mins // dur) * dur)
         nxt  = prev + timedelta(minutes=dur)
@@ -305,44 +388,38 @@ def is_valid_slot_time(event: str, time_str: str) -> tuple:
 #  ПОДСКАЗКИ СВОБОДНЫХ СЛОТОВ
 # ══════════════════════════════════════════════
 def get_suggested_slots(event, records, preferred_master=None, top_n=6) -> list:
-    config = EVENTS_CONFIG[event]
-    if event == "нутрициолог":
-        booked = len([r for r in records if str(r.get("Время", "")) == "15:00"])
-        rem = config["capacity"] - booked
-        return [("15:00", rem)] if rem > 0 else []
-    start_dt = datetime.strptime(config["start"], "%H:%M")
-    end_dt   = datetime.strptime(config["end"],   "%H:%M")
-    delta    = timedelta(minutes=config["duration"])
-    slots = []
-    cur = start_dt
-    while cur < end_dt:
-        s = cur.strftime("%H:%M")
+    """
+    Возвращает [(time_str, available_count), ...] — отсортировано
+    по убыванию свободных мест, потом по времени.
+    """
+    config     = EVENTS_CONFIG[event]
+    all_slots  = get_slot_list(event)
+    slots      = []
+
+    for s in all_slots:
         at_slot = [r for r in records if str(r.get("Время", "")) == s]
+
         if event in MASTERS_CONFIG:
             avail = count_available_masters(event, s, at_slot, preferred_master)
         else:
             avail = config["capacity"] - len(at_slot)
+
         if avail > 0:
             slots.append((s, avail))
-        cur += delta
+
     slots.sort(key=lambda x: (-x[1], x[0]))
     return slots[:top_n]
 
 
 def get_available_slots(event, records, preferred_master=None) -> list:
-    config = EVENTS_CONFIG[event]
-    free = []
-    if event == "нутрициолог":
-        booked = len([r for r in records if str(r.get("Время", "")) == "15:00"])
-        rem = config["capacity"] - booked
-        return [f"15:00 (осталось {plural_places(rem)})"] if rem > 0 else []
-    start_dt = datetime.strptime(config["start"], "%H:%M")
-    end_dt   = datetime.strptime(config["end"],   "%H:%M")
-    delta    = timedelta(minutes=config["duration"])
-    cur = start_dt
-    while cur < end_dt:
-        s = cur.strftime("%H:%M")
+    """Все свободные слоты (для команды availability)."""
+    config    = EVENTS_CONFIG[event]
+    all_slots = get_slot_list(event)
+    free      = []
+
+    for s in all_slots:
         at_slot = [r for r in records if str(r.get("Время", "")) == s]
+
         if event in MASTERS_CONFIG:
             avail = count_available_masters(event, s, at_slot, preferred_master)
             if avail > 0:
@@ -350,8 +427,8 @@ def get_available_slots(event, records, preferred_master=None) -> list:
         else:
             avail = config["capacity"] - len(at_slot)
             if avail > 0:
-                free.append(s)
-        cur += delta
+                free.append(f"{s} (осталось {plural_places(avail)})")
+
     return free
 
 
@@ -368,27 +445,17 @@ def build_slot_keyboard(event, suggested, preferred_master=None) -> InlineKeyboa
     for time_str, avail in suggested:
         if event in MASTERS_CONFIG:
             label = f"🕐 {time_str}  —  свободно {plural_masters(avail, event)}"
-        elif event == "нутрициолог":
-            label = f"🕐 {time_str}  —  осталось {plural_places(avail)}"
         else:
-            label = f"🕐 {time_str}"
+            label = f"🕐 {time_str}  —  осталось {plural_places(avail)}"
         cb = f"slot|{event}|{time_str}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=cb)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def build_services_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки для быстрого старта записи на каждую услугу."""
-    icons = {
-        "аромапсихолог": "🌸",
-        "макияж": "💄",
-        "нутрициолог": "🥗",
-        "массаж": "💆‍♀️",
-        "гадалки": "🔮",
-    }
     buttons = []
     for ev_key in EVENTS_CONFIG:
-        icon = icons.get(ev_key, "✨")
+        icon = EVENT_ICONS.get(ev_key, "✨")
         buttons.append([InlineKeyboardButton(
             text=f"{icon} Записаться — {ef(ev_key)}",
             callback_data=f"start_book|{ev_key}",
@@ -436,6 +503,122 @@ def check_time_conflict(new_event, new_time_str, user_bookings):
         if ns < be and ne > bs:
             return True, b["event"], b["time"]
     return False, None, None
+
+
+# ══════════════════════════════════════════════
+#  ПРОГРАММА ДНЯ — АВТОСОСТАВЛЕНИЕ
+# ══════════════════════════════════════════════
+def find_gap_suggestions(user_id_str: str, bookings: list) -> list:
+    booked_events = {b["event"] for b in bookings}
+    suggestions = []
+
+    for ev, cfg in EVENTS_CONFIG.items():
+        if ev in booked_events:
+            continue
+        try:
+            ws      = sheet.worksheet(cfg["sheet"])
+            records = ws.get_all_records()
+        except Exception:
+            continue
+
+        available = get_suggested_slots(ev, records, top_n=10)
+
+        fitting = []
+        for time_str, avail in available:
+            conflict, _, _ = check_time_conflict(ev, time_str, bookings)
+            if not conflict:
+                fitting.append((time_str, avail))
+            if len(fitting) >= 3:
+                break
+
+        if fitting:
+            suggestions.append({
+                "event": ev,
+                "icon":  EVENT_ICONS.get(ev, "✨"),
+                "slots": fitting,
+            })
+
+    return suggestions
+
+
+def build_program_message(user_id_str: str) -> tuple:
+    bookings = get_all_user_bookings(user_id_str)
+    if not bookings:
+        return None, None
+
+    bookings.sort(key=lambda b: b["time"])
+
+    total   = len(EVENTS_CONFIG)
+    booked  = len(bookings)
+    header  = f"📋 **Ваша бьюти-программа** ({booked} из {total}):\n"
+
+    lines = []
+    for i, b in enumerate(bookings):
+        icon     = EVENT_ICONS.get(b["event"], "✨")
+        end_time = (datetime.strptime(b["time"], "%H:%M")
+                    + timedelta(minutes=b["duration"])).strftime("%H:%M")
+
+        connector = "└" if i == len(bookings) - 1 else "├"
+        spacer    = "   " if i == len(bookings) - 1 else "│  "
+
+        line = f"{connector} **{b['time']} – {end_time}**  {icon} {ef(b['event'])}"
+
+        details = []
+        mi = get_master_display_info(b["event"], b.get("master", ""))
+        if mi:
+            details.append(mi)
+        if b["event"] == "нутрициолог":
+            details.append("📍 Зал совещаний, 5 этаж")
+        if b["event"] == "семейный нутрициолог":
+            details.append("📍 Зал совещаний, 5 этаж")
+
+        if details:
+            line += f"\n{spacer}↳ _{', '.join(details)}_"
+
+        lines.append(line)
+
+    text = header + "\n" + "\n".join(lines)
+
+    if booked >= total:
+        text += (
+            "\n\n🎉 **Вы записаны на все активности!**\n"
+            "Ваш бьюти-день будет незабываемым! 💖"
+        )
+        return text, None
+
+    suggestions = find_gap_suggestions(user_id_str, bookings)
+
+    if suggestions:
+        text += "\n\n━━━━━━━━━━━━━━━━━━━\n"
+        text += "💡 **Ещё можно успеть:**\n"
+        buttons = []
+        for s in suggestions:
+            times_str = ", ".join(t for t, _ in s["slots"])
+            text += f"{s['icon']} {ef(s['event'])} — окошки: {times_str}\n"
+            buttons.append([InlineKeyboardButton(
+                text=f"{s['icon']} Записаться — {ef(s['event'])}",
+                callback_data=f"start_book|{s['event']}",
+            )])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        return text, kb
+
+    booked_events = {b["event"] for b in bookings}
+    unbooked = [ev for ev in EVENTS_CONFIG if ev not in booked_events]
+    if unbooked:
+        text += (
+            "\n\n💡 Остальные активности пока не вписываются в ваше расписание, "
+            "но следите за обновлениями — окошки могут освободиться! ✨"
+        )
+    return text, None
+
+
+# ══════════════════════════════════════════════
+#  ОТПРАВКА ПРОГРАММЫ (утилита)
+# ══════════════════════════════════════════════
+async def send_program(chat_id: int, user_id_str: str):
+    text, kb = build_program_message(user_id_str)
+    if text:
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════
@@ -526,6 +709,7 @@ async def execute_booking(
 
         worksheet.append_row([user_id, username, full_name, time_str, master_id or "Записано"])
 
+    # Напоминание
     try:
         now  = datetime.now()
         ev_t = datetime.strptime(time_str, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
@@ -539,6 +723,7 @@ async def execute_booking(
     except Exception as e:
         logging.error(f"Ошибка напоминания: {e}")
 
+    # Ответ
     if is_reschedule:
         msg = f"🔄 Перенесли вашу запись {ef(event, 'to')}. Ждём вас в **{time_str}**!"
     else:
@@ -558,6 +743,8 @@ async def execute_booking(
 
     if event == "нутрициолог":
         msg += "\n📍 Зал совещаний, 5 этаж 🥗"
+    if event == "семейный нутрициолог":
+        msg += "\n📍 Зал совещаний, 5 этаж 👨‍👩‍👧"
 
     return {"ok": True, "text": msg}
 
@@ -567,18 +754,17 @@ async def execute_booking(
 # ══════════════════════════════════════════════
 @dp.message()
 async def handle_booking(message: types.Message, state: FSMContext):
-    # ── Текст приветствия (без кнопок — для fallback) ──
     welcome_text = (
         "Привет, красавицы! 👋 Я ваш заботливый бот-помощник.\n"
         "Пишите мне свободно, например:\n"
         "✨ *«Запиши на массаж в 12:20»*\n"
         "🔮 *«Запиши к гадалке Юлии на 15:00»*\n"
-        "💆 *«Хочу к Виктору на массаж»*\n"
+        "🎨 *«Хочу в мастерскую Чехова на 14:00»*\n"
         "🔄 *«Перенеси макияж на 11:30»*\n"
         "❌ *«Отмени массаж»*\n"
         "📅 *«Какие окошки у Натэллы?»*\n"
-        "📋 *«Куда я записана?»*\n"
-        "ℹ️ *«Расскажи про услуги»* — подробности об активностях\n"
+        "📋 *«Моя программа»* — ваше расписание на день\n"
+        "ℹ️ *«Расскажи про услуги»* — подробности\n"
     )
 
     intent        = await parse_intent(message.text)
@@ -611,7 +797,6 @@ async def handle_booking(message: types.Message, state: FSMContext):
     # ── ОБЫЧНЫЙ РАЗБОР ──
     else:
         if not intent or not intent.get("action"):
-            # Не распознали — показываем приветствие + кнопки услуг
             kb = build_services_keyboard()
             await message.reply(
                 welcome_text + "\n**Или выберите услугу для записи:**",
@@ -621,7 +806,8 @@ async def handle_booking(message: types.Message, state: FSMContext):
             return
 
         action           = intent["action"]
-        event            = EVENT_ALIASES.get((intent.get("event") or "").lower(), (intent.get("event") or "").lower())
+        raw_event        = (intent.get("event") or "").lower().strip()
+        event            = EVENT_ALIASES.get(raw_event, raw_event)
         time_str         = intent.get("time")
         preferred_master = intent.get("preferred_master")
         await state.clear()
@@ -629,23 +815,20 @@ async def handle_booking(message: types.Message, state: FSMContext):
     user_id_str = str(message.from_user.id)
     username    = f"@{message.from_user.username}" if message.from_user.username else "-"
 
-    # ── МОИ ЗАПИСИ ──
+    # ── МОИ ЗАПИСИ / МОЯ ПРОГРАММА ──
     if action == "my_bookings":
-        wait = await message.reply("⏳ Ищу ваши бьюти-планы…")
-        bookings = get_all_user_bookings(user_id_str)
-        if not bookings:
-            await wait.edit_text("У вас пока нет ни одной записи. Давайте это исправим! ✨")
+        wait = await message.reply("⏳ Составляю вашу программу…")
+        text, kb = build_program_message(user_id_str)
+        if not text:
+            kb = build_services_keyboard()
+            await wait.edit_text("У вас пока нет ни одной записи.\nДавайте составим ваш бьюти-план! ✨")
+            await bot.send_message(
+                message.chat.id,
+                "👇 **Выберите первую активность:**",
+                reply_markup=kb, parse_mode="Markdown",
+            )
             return
-        txt = "📋 **Ваши планы на сегодня:**\n\n"
-        for b in bookings:
-            line = f"🔸 **{ef(b['event'])}** — в {b['time']}"
-            mi = get_master_display_info(b["event"], b.get("master", ""))
-            if mi:
-                line += f" ({mi})"
-            if b["event"] == "нутрициолог":
-                line += " 📍 Зал совещаний, 5 этаж"
-            txt += line + "\n"
-        await wait.edit_text(txt, parse_mode="Markdown")
+        await wait.edit_text(text, reply_markup=kb, parse_mode="Markdown")
         return
 
     # ── ОТМЕНИТЬ ВСЁ ──
@@ -664,33 +847,27 @@ async def handle_booking(message: types.Message, state: FSMContext):
         )
         return
 
-    # ══════════════════════════════════════════
-    #  ИНФОРМАЦИЯ ОБ УСЛУГАХ (info)
-    # ══════════════════════════════════════════
+    # ── ИНФОРМАЦИЯ ОБ УСЛУГАХ ──
     if action == "info":
         if event and event in EVENTS_CONFIG:
-            # ── Инфо об одной конкретной услуге + предложение записаться ──
             cfg = EVENTS_CONFIG[event]
             text = f"ℹ️ {cfg['desc']}\n\n⏰ Время работы: **{cfg['start']} — {cfg['end']}**"
-
+            if "custom_slots" in cfg:
+                text += f"\n🕐 Сеансы: **{', '.join(cfg['custom_slots'])}**"
             worksheet = sheet.worksheet(cfg["sheet"])
             records   = worksheet.get_all_records()
             suggested = get_suggested_slots(event, records, preferred_master)
-
             if suggested:
                 text += "\n\n✨ **Хотите записаться? Вот свободные окошки:**"
                 kb = build_slot_keyboard(event, suggested, preferred_master)
                 await state.update_data(action="book", event=event, preferred_master=preferred_master)
                 await state.set_state(BookingState.waiting_for_time)
-                await message.reply(
-                    text + "\n\nИли напишите время вручную (ЧЧ:ММ).",
-                    reply_markup=kb, parse_mode="Markdown",
-                )
+                await message.reply(text + "\n\nИли напишите время вручную (ЧЧ:ММ).",
+                                    reply_markup=kb, parse_mode="Markdown")
             else:
                 text += f"\n\nК сожалению, свободных окошек {ef(event, 'at')} не осталось 😔"
                 await message.reply(text, parse_mode="Markdown")
         else:
-            # ── Инфо обо ВСЕХ услугах + кнопки записи ──
             all_text = "✨ **Наши активности:**\n\n"
             all_text += "\n\n".join(cfg["desc"] for cfg in EVENTS_CONFIG.values())
             all_text += "\n\n👇 **Выберите услугу, чтобы записаться:**"
@@ -700,7 +877,6 @@ async def handle_booking(message: types.Message, state: FSMContext):
 
     # ── НЕ УКАЗАНО МЕРОПРИЯТИЕ ──
     if action in ("book", "reschedule", "availability") and event not in EVENTS_CONFIG:
-        # Предлагаем выбрать из кнопок
         kb = build_services_keyboard()
         await message.reply(
             "Уточните, пожалуйста, на какую услугу записаться? ✨\n\n"
@@ -709,7 +885,6 @@ async def handle_booking(message: types.Message, state: FSMContext):
         )
         return
 
-    # ── Событие не распознано — fallback ──
     if event not in EVENTS_CONFIG:
         kb = build_services_keyboard()
         await message.reply(
@@ -740,6 +915,7 @@ async def handle_booking(message: types.Message, state: FSMContext):
             if scheduler.get_job(jid):
                 scheduler.remove_job(jid)
             await message.reply(f"🗑 Запись {ef(event, 'to')} отменена. Ждём в другой раз 🌸", parse_mode="Markdown")
+            await send_program(message.chat.id, user_id_str)
         else:
             await message.reply(f"У вас нет записи {ef(event, 'to')} 😊", parse_mode="Markdown")
         return
@@ -770,7 +946,7 @@ async def handle_booking(message: types.Message, state: FSMContext):
         await message.reply("Пожалуйста, уточните время (например, 14:20) 🕒")
         return
 
-    # ── ВЫПОЛНЕНИЕ ЗАПИСИ ──
+    # ── ВЫПОЛНЕНИЕ ЗАПИСИ + ПРОГРАММА ДНЯ ──
     result = await execute_booking(
         user_id=message.from_user.id,
         username=username,
@@ -781,6 +957,8 @@ async def handle_booking(message: types.Message, state: FSMContext):
         is_reschedule=(action == "reschedule"),
     )
     await message.reply(result["text"], parse_mode="Markdown")
+    if result["ok"]:
+        await send_program(message.chat.id, user_id_str)
 
 
 # ══════════════════════════════════════════════
@@ -815,6 +993,9 @@ async def process_slot_selection(callback: types.CallbackQuery, state: FSMContex
     )
     await callback.message.edit_text(result["text"], parse_mode="Markdown")
 
+    if result["ok"]:
+        await send_program(callback.message.chat.id, str(user.id))
+
 
 # ══════════════════════════════════════════════
 #  CALLBACK: БЫСТРЫЙ СТАРТ ЗАПИСИ НА УСЛУГУ
@@ -822,7 +1003,7 @@ async def process_slot_selection(callback: types.CallbackQuery, state: FSMContex
 @dp.callback_query(F.data.startswith("start_book|"))
 async def process_start_book(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    event = callback.data.split("|")[1]
+    event = callback.data.split("|", 1)[1]
 
     if event not in EVENTS_CONFIG:
         await callback.message.edit_text("Услуга не найдена 😔")
