@@ -221,6 +221,7 @@ def plural_places(n: int) -> str:
 #  СУПЕР-КЭШ (IN-MEMORY STATE)
 # ══════════════════════════════════════════════
 _booking_locks: dict[str, asyncio.Lock] = {}
+_user_locks: dict[str, asyncio.Lock] = {}
 _sheet_cache: dict[str, list] = {}
 
 
@@ -229,6 +230,10 @@ def get_lock(event: str) -> asyncio.Lock:
         _booking_locks[event] = asyncio.Lock()
     return _booking_locks[event]
 
+def get_user_lock(user_id: str) -> asyncio.Lock:
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
 
 def _fetch_all_sheets_sync() -> dict:
     data = {}
@@ -582,85 +587,89 @@ async def execute_booking(
     if not valid:
         return {"ok": False, "text": err}
 
-    async with get_lock(event):
-        records = _sheet_cache.get(event, [])
-        user_row_exists = any(str(r.get("ID", "")) == uid for r in records)
+    # User lock — сериализует ВСЕ записи одного пользователя
+    # Event lock — сериализует записи в один слот мероприятия
+    async with get_user_lock(uid):
+        async with get_lock(event):
+            records = _sheet_cache.get(event, [])
+            user_row_exists = any(str(r.get("ID", "")) == uid for r in records)
 
-        if is_reschedule:
-            if not user_row_exists:
-                return {"ok": False, "text": f"У вас нет записи {ef(event, 'to')}."}
-        elif user_row_exists:
-            bt = next(
-                (r.get("Время", "") for r in records if str(r.get("ID", "")) == uid),
-                "?",
-            )
-            return {
-                "ok": False,
-                "text": f"❌ Вы уже записаны {ef(event, 'to')} (время: {bt}).",
-            }
-
-        conflict, c_ev, c_t = check_time_conflict(
-            event, time_str, get_all_user_bookings(uid)
-        )
-        if conflict:
-            return {
-                "ok": False,
-                "text": f"Ой, накладочка! В {time_str} вы будете {ef(c_ev, 'at')}.",
-            }
-
-        at_time = [r for r in records if str(r.get("Время", "")) == time_str]
-        master = None
-        master_id = ""
-
-        if event in MASTERS_CONFIG:
-            master, merr = find_available_master(
-                event, time_str, at_time, preferred_master
-            )
-            if not master:
-                avail_text = format_slots_message(
-                    get_available_slots(event, records)
+            if is_reschedule:
+                if not user_row_exists:
+                    return {"ok": False, "text": f"У вас нет записи {ef(event, 'to')}."}
+            elif user_row_exists:
+                bt = next(
+                    (r.get("Время", "") for r in records if str(r.get("ID", "")) == uid),
+                    "?",
                 )
                 return {
                     "ok": False,
-                    "text": merr or f"На {time_str} все заняты 😔\n💡 Свободные: {avail_text}",
+                    "text": f"❌ Вы уже записаны {ef(event, 'to')} (время: {bt}).",
                 }
-            master_id = master["id"]
-        elif len(at_time) >= cfg["capacity"]:
-            avail_text = format_slots_message(get_available_slots(event, records))
-            return {
-                "ok": False,
-                "text": f"На {time_str} всё занято 😔\n💡 Свободные: {avail_text}",
+
+            # Конфликт теперь проверяется АТОМАРНО —
+            # user lock гарантирует что другая запись этого же юзера
+            # не проскочит между check и write
+            conflict, c_ev, c_t = check_time_conflict(
+                event, time_str, get_all_user_bookings(uid)
+            )
+            if conflict:
+                return {
+                    "ok": False,
+                    "text": f"Ой, накладочка! В {time_str} вы будете {ef(c_ev, 'at')}.",
+                }
+
+            at_time = [r for r in records if str(r.get("Время", "")) == time_str]
+            master = None
+            master_id = ""
+
+            if event in MASTERS_CONFIG:
+                master, merr = find_available_master(
+                    event, time_str, at_time, preferred_master
+                )
+                if not master:
+                    avail_text = format_slots_message(
+                        get_available_slots(event, records)
+                    )
+                    return {
+                        "ok": False,
+                        "text": merr or f"На {time_str} все заняты 😔\n💡 Свободные: {avail_text}",
+                    }
+                master_id = master["id"]
+            elif len(at_time) >= cfg["capacity"]:
+                avail_text = format_slots_message(get_available_slots(event, records))
+                return {
+                    "ok": False,
+                    "text": f"На {time_str} всё занято 😔\n💡 Свободные: {avail_text}",
+                }
+
+            ws = sheet.worksheet(cfg["sheet"])
+
+            if is_reschedule:
+                def delete_row_sync():
+                    ids = [str(v) for v in ws.col_values(1)]
+                    if uid in ids:
+                        ws.delete_rows(ids.index(uid) + 1)
+
+                await asyncio.to_thread(delete_row_sync)
+                _sheet_cache[event] = [
+                    r for r in _sheet_cache[event] if str(r.get("ID", "")) != uid
+                ]
+
+            new_record = {
+                "ID": user_id,
+                "Username": username,
+                "ФИО": full_name,
+                "Время": time_str,
+                "Мастер/Детали": master_id or "Записано",
             }
+            await asyncio.to_thread(
+                ws.append_row,
+                [user_id, username, full_name, time_str, master_id or "Записано"],
+            )
+            _sheet_cache[event].append(new_record)
 
-        # Запись в Google Sheets
-        ws = sheet.worksheet(cfg["sheet"])
-
-        if is_reschedule:
-            def delete_row_sync():
-                ids = ws.col_values(1)
-                uid_candidates = [str(v) for v in ids]
-                if uid in uid_candidates:
-                    ws.delete_rows(uid_candidates.index(uid) + 1)
-
-            await asyncio.to_thread(delete_row_sync)
-            _sheet_cache[event] = [
-                r for r in _sheet_cache[event] if str(r.get("ID", "")) != uid
-            ]
-
-        new_record = {
-            "ID": user_id,
-            "Username": username,
-            "ФИО": full_name,
-            "Время": time_str,
-            "Мастер/Детали": master_id or "Записано",
-        }
-        await asyncio.to_thread(
-            ws.append_row,
-            [user_id, username, full_name, time_str, master_id or "Записано"],
-        )
-        _sheet_cache[event].append(new_record)
-
-    # Напоминание
+    # Напоминание — вне локов
     now = datetime.now()
     ev_t = datetime.strptime(time_str, "%H:%M").replace(
         year=now.year, month=now.month, day=now.day
