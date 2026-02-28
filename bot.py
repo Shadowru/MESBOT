@@ -715,8 +715,26 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message()
 async def handle_booking(message: types.Message, state: FSMContext):
+    # ════════ ДОБАВИТЬ ЭТОТ БЛОК ════════
+    # Ручная проверка команд, чтобы не путать AI
+    text_lower = message.text.lower().strip()
+    if text_lower in ["моя программа", "мои записи", "расписание", "программа"]:
+        await state.clear()
+        uid = str(message.from_user.id)
+        text = build_program_message(uid)
+        if text:
+            await message.reply(text, parse_mode="Markdown")
+        else:
+            await message.reply(
+                "У вас пока нет записей!",
+                reply_markup=build_services_keyboard(),
+            )
+        return
+    # ════════════════════════════════════
+
     current_state = await state.get_state()
     intent = await parse_intent(message.text)
+
 
     # ── Если мы в режиме ожидания времени и NLP не распознал осмысленный интент ──
     if current_state == BookingState.waiting_for_time.state:

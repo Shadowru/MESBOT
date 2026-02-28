@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем код бота
 COPY bot.py .
+COPY .env .
+COPY google_creds.json .
 
 # Запускаем бота
 CMD ["python", "bot.py"]
