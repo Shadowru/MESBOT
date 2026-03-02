@@ -15,6 +15,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
@@ -93,6 +94,16 @@ EVENTS_CONFIG = {
         "start": "15:00", "end": "16:30",
         "desc": "👨‍👩‍👧 **Семейный нутрициолог**", "fixed_time": "15:00",
     },
+}
+
+SERVICE_DESCRIPTIONS = {
+    "аромапсихолог": "Индивидуальная консультация с подбором аромата под ваше настроение",
+    "макияж": "Профессиональный макияж от визажистов — обновите образ за 10 минут",
+    "нутрициолог": "Групповая лекция о здоровом питании и полезных привычках",
+    "массаж": "Расслабляющий экспресс-массаж — снимите напряжение",
+    "гадалки": "Мистический сеанс Таро — загляните в будущее",
+    "мастерская чехова": "Творческий мастер-класс — создайте картину в авторском багете",
+    "семейный нутрициолог": "Консультация о правильном питании для всей семьи",
 }
 
 MASTERS_CONFIG = {
@@ -175,16 +186,16 @@ EVENT_ICONS = {
 }
 
 WELCOME_TEXT = (
-    "Привет, красавицы! 👋 Я ваш заботливый бот-помощник.\n"
-    "Пишите мне свободно, например:\n"
-    "✨ *«Запиши на массаж в 12:20»*\n"
-    "🔮 *«Запиши к гадалке Юлии на 15:00»*\n"
-    "🎨 *«Хочу в мастерскую Чехова на 14:00»*\n"
-    "🔄 *«Перенеси макияж на 11:30»*\n"
-    "❌ *«Отмени массаж»*\n"
-    "📅 *«Какие окошки у Натэллы?»*\n"
-    "📋 *«Моя программа»* — ваше расписание на день\n"
-    "ℹ️ *«Расскажи про услуги»* — подробности\n"
+    "✨ **Добро пожаловать!** ✨\n\n"
+    "Я помогу составить идеальную бьюти-программу на сегодня.\n\n"
+    "💬 **Просто напишите**, например:\n"
+    "  › _«Запиши на массаж в 12:20»_\n"
+    "  › _«Хочу к гадалке Юлии на 15:00»_\n"
+    "  › _«Перенеси макияж на 11:30»_\n"
+    "  › _«Отмени массаж»_\n"
+    "  › _«Отмени все»_\n"
+    "  › _«Моя программа»_\n\n"
+    "Или выберите услугу из списка 👇"
 )
 
 
@@ -223,17 +234,20 @@ def plural_places(n: int) -> str:
 _booking_locks: dict[str, asyncio.Lock] = {}
 _user_locks: dict[str, asyncio.Lock] = {}
 _sheet_cache: dict[str, list] = {}
-
+_last_sync_ok: datetime | None = None
+_cache_ready: bool = False
 
 def get_lock(event: str) -> asyncio.Lock:
     if event not in _booking_locks:
         _booking_locks[event] = asyncio.Lock()
     return _booking_locks[event]
 
+
 def get_user_lock(user_id: str) -> asyncio.Lock:
     if user_id not in _user_locks:
         _user_locks[user_id] = asyncio.Lock()
     return _user_locks[user_id]
+
 
 def _fetch_all_sheets_sync() -> dict:
     data = {}
@@ -243,41 +257,93 @@ def _fetch_all_sheets_sync() -> dict:
 
 
 async def sync_cache_with_google():
-    global _sheet_cache
+    global _sheet_cache, _last_sync_ok, _cache_ready
     logging.info("Скачиваю данные из Google Sheets...")
     _sheet_cache = await asyncio.to_thread(_fetch_all_sheets_sync)
+    _last_sync_ok = datetime.now()
+    _cache_ready = True
     logging.info("Данные успешно загружены в память!")
 
 
 async def background_sync():
-    global _sheet_cache
+    global _sheet_cache, _last_sync_ok
     try:
         _sheet_cache = await asyncio.to_thread(_fetch_all_sheets_sync)
+        _last_sync_ok = datetime.now()
     except Exception as e:
         logging.error(f"Фоновая синхронизация не удалась: {e}")
 
+# ══════════════════════════════════════════════
+#  HEALTH CHECK SERVER
+# ══════════════════════════════════════════════
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
+SYNC_STALE_MINUTES = int(os.getenv("SYNC_STALE_MINUTES", "10"))
+
+async def handle_healthz(request: web.Request) -> web.Response:
+    return web.json_response({"status": "alive"}, status=200)
+
+
+async def handle_readyz(request: web.Request) -> web.Response:
+    errors = []
+    if not _cache_ready:
+        errors.append("cache not loaded yet")
+    if _last_sync_ok is None:
+        errors.append("no successful sync")
+    elif (datetime.now() - _last_sync_ok).total_seconds() > SYNC_STALE_MINUTES * 60:
+        errors.append(
+            f"last sync was {_last_sync_ok.isoformat()}, "
+            f"stale > {SYNC_STALE_MINUTES}m"
+        )
+    if errors:
+        return web.json_response(
+            {"status": "not ready", "errors": errors}, status=503
+        )
+    return web.json_response(
+        {
+            "status": "ready",
+            "last_sync": _last_sync_ok.isoformat(),
+            "cached_events": len(_sheet_cache),
+        },
+        status=200,
+    )
+
+
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/healthz", handle_healthz)
+    app.router.add_get("/readyz", handle_readyz)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    logging.info(f"Health server started on :{HEALTH_PORT}")
+    return runner
 
 # ══════════════════════════════════════════════
 #  NLP: АНАЛИЗ ТЕКСТА
 # ══════════════════════════════════════════════
 async def parse_intent(text: str) -> dict | None:
-    prompt = (
+    prompt = (                                                          # ← FIX: обновлённый промпт
         "Ты заботливый бот-ассистент для записи девушек на корпоративные мероприятия.\n"
         "Доступные мероприятия: аромапсихолог, макияж, нутрициолог, массаж, "
         "гадалки, мастерская чехова, семейный нутрициолог\n"
-        "Определи action: book, cancel, reschedule, availability, info, my_bookings.\n"
-        "Если просто название (массаж) -> book.\n"
+        "Определи action: book, cancel, cancel_all, reschedule, availability, info, my_bookings.\n"
+        "Правила:\n"
+        '- "отмени всё" / "отмени все" / "отменить все записи" / "удали всё" → action=cancel_all, event=""\n'
+        '- "отмени массаж" → action=cancel, event="массаж"\n'
+        '- "отмени" (без уточнения услуги) → action=cancel_all, event=""\n'
+        "- Если просто название (массаж) -> book.\n"
         'Ответь JSON: {"action":"...","event":"...","time":"HH:MM","preferred_master":"..."}\n'
+        "Если event не определён, верни пустую строку.\n"
         f"Текст: {text}"
     )
     try:
         response = await llm_client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="openai/gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
         raw = response.choices[0].message.content
-        # Извлекаем JSON даже если LLM обернул его в markdown
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             return json.loads(m.group())
@@ -426,10 +492,67 @@ def format_slots_message(slots: list[str]) -> str:
     return text
 
 
-def _slot_button_label(event: str, time_str: str, avail: int) -> str:
+def build_service_card(event: str) -> str:
+    cfg = EVENTS_CONFIG[event]
+    icon = EVENT_ICONS.get(event, "✨")
+    title = ef(event)
+    desc = SERVICE_DESCRIPTIONS.get(event, "")
+
+    records = _sheet_cache.get(event, [])
+    available = get_suggested_slots(event, records, top_n=99)
+    total_slots = len(get_slot_list(event))
+
+    lines = [f"{icon} **{title}**"]
+    if desc:
+        lines.append(f"_{desc}_")
+    lines.append("")
+    lines.append(f"🕐 {cfg['start']} — {cfg['end']}  ·  ⏱ {cfg['duration']} мин")
+
+    if "fixed_time" in cfg:
+        at_time = [r for r in records if str(r.get("Время", "")) == cfg["fixed_time"]]
+        avail = cfg["capacity"] - len(at_time)
+        lines.append(f"👥 Осталось {plural_places(max(avail, 0))}")
+    elif available:
+        lines.append(f"📊 Свободно {len(available)} из {total_slots} слотов")
+    else:
+        lines.append("⛔ Свободных мест нет")
+
     if event in MASTERS_CONFIG:
-        return f"🕐 {time_str} — свободно {plural_masters(avail, event)}"
-    return f"🕐 {time_str} — осталось {plural_places(avail)}"
+        n = len(MASTERS_CONFIG[event])
+        lines.append(f"👩‍⚕️ Работают {plural_masters(n, event)}")
+
+    return "\n".join(lines)
+
+
+def build_services_keyboard(user_id: str = None) -> InlineKeyboardMarkup:
+    buttons = []
+    for ev in EVENTS_CONFIG:
+        icon = EVENT_ICONS.get(ev, "✨")
+        title = ef(ev)
+
+        already_booked = False
+        if user_id:
+            records = _sheet_cache.get(ev, [])
+            already_booked = any(str(r.get("ID", "")) == user_id for r in records)
+
+        if already_booked:
+            buttons.append([InlineKeyboardButton(
+                text=f"✅ {title} — вы записаны",
+                callback_data=f"my_booking_detail|{ev}",
+            )])
+        else:
+            has_slots = bool(get_suggested_slots(ev, _sheet_cache.get(ev, []), top_n=1))
+            if has_slots:
+                buttons.append([InlineKeyboardButton(
+                    text=f"{icon} {title}",
+                    callback_data=f"start_book|{ev}",
+                )])
+            else:
+                buttons.append([InlineKeyboardButton(
+                    text=f"⛔ {title} — мест нет",
+                    callback_data=f"no_slots|{ev}",
+                )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def build_slot_keyboard(
@@ -437,25 +560,20 @@ def build_slot_keyboard(
     suggested: list[tuple[str, int]],
     action: str = "book",
 ) -> InlineKeyboardMarkup:
-    """Кнопки слотов. action кодируется в callback_data → не зависим от FSM."""
-    buttons = [
-        [InlineKeyboardButton(
-            text=_slot_button_label(event, t, a),
+    buttons = []
+    for t, a in suggested:
+        if event in MASTERS_CONFIG:
+            avail_text = plural_masters(a, event)
+        else:
+            avail_text = plural_places(a)
+        buttons.append([InlineKeyboardButton(
+            text=f"🕐 {t}  ·  {avail_text}",
             callback_data=f"slot|{event}|{t}|{action}",
-        )]
-        for t, a in suggested
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def build_services_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"{EVENT_ICONS.get(ev, '✨')} Записаться — {ef(ev)}",
-            callback_data=f"start_book|{ev}",
-        )]
-        for ev in EVENTS_CONFIG
-    ]
+        )])
+    buttons.append([InlineKeyboardButton(
+        text="← Назад к услугам",
+        callback_data="back_to_services",
+    )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -495,62 +613,80 @@ def build_program_message(user_id_str: str) -> str | None:
         return None
     bookings.sort(key=lambda b: b["time"])
 
-    lines = []
+    total_events = len(EVENTS_CONFIG)
+    booked_count = len(bookings)
+    progress = "●" * booked_count + "○" * (total_events - booked_count)
+
+    lines = [
+        f"📋 **Ваша бьюти-программа**",
+        f"  {progress}  {booked_count} из {total_events}",
+        "",
+    ]
+
     for i, b in enumerate(bookings):
-        is_last = i == len(bookings) - 1
         end_time = (
             datetime.strptime(b["time"], "%H:%M")
             + timedelta(minutes=b["duration"])
         ).strftime("%H:%M")
         icon = EVENT_ICONS.get(b["event"], "✨")
-        prefix = "└" if is_last else "├"
-        line = f"{prefix} **{b['time']} – {end_time}**  {icon} {ef(b['event'])}"
+
+        line = f"  {icon}  **{b['time']} — {end_time}**  │  {ef(b['event'])}"
 
         details = []
         if b["event"] in MASTERS_CONFIG:
             for m in MASTERS_CONFIG[b["event"]]:
                 if m["id"] == b.get("master"):
-                    loc = f", {m['location']}" if m.get("location") else ""
-                    details.append(m["label"] + loc)
+                    details.append(f"Специалист: {m['label']}")
+                    if m.get("location"):
+                        details.append(f"📍 {m['location']}")
         if b["event"] in ("нутрициолог", "семейный нутрициолог"):
             details.append("📍 Зал совещаний, 5 этаж")
 
         if details:
-            indent = "   " if is_last else "│  "
-            line += f"\n{indent}↳ _{', '.join(details)}_"
+            for d in details:
+                line += f"\n        ↳ _{d}_"
         lines.append(line)
 
-    total = len(bookings)
-    return f"📋 **Ваша бьюти-программа** ({total}/{len(EVENTS_CONFIG)}):\n\n" + "\n".join(lines)
+    return "\n".join(lines)
 
 
 async def send_program(chat_id: int, user_id_str: str):
-    """Отправляет программу + кнопки для дальнейшей записи."""
     text = build_program_message(user_id_str)
-    if text:
-        remaining = [
-            ev for ev in EVENTS_CONFIG
-            if not any(
-                str(r.get("ID", "")) == user_id_str
-                for r in _sheet_cache.get(ev, [])
-            )
-        ]
-        kb = None
-        if remaining:
-            buttons = [
-                [InlineKeyboardButton(
-                    text=f"{EVENT_ICONS.get(ev, '✨')} Записаться — {ef(ev)}",
-                    callback_data=f"start_book|{ev}",
-                )]
-                for ev in remaining
-            ]
-            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await bot.send_message(
-            chat_id,
-            text + ("\n\n✨ **Записаться ещё:**" if remaining else ""),
-            reply_markup=kb,
-            parse_mode="Markdown",
+    if not text:
+        return
+
+    remaining_bookable = []
+    remaining_full = []
+    for ev in EVENTS_CONFIG:
+        already = any(
+            str(r.get("ID", "")) == user_id_str
+            for r in _sheet_cache.get(ev, [])
         )
+        if already:
+            continue
+        has_slots = bool(get_suggested_slots(ev, _sheet_cache.get(ev, []), top_n=1))
+        if has_slots:
+            remaining_bookable.append(ev)
+        else:
+            remaining_full.append(ev)
+
+    if remaining_bookable:
+        buttons = [
+            [InlineKeyboardButton(
+                text=f"{EVENT_ICONS.get(ev, '✨')} {ef(ev)}",
+                callback_data=f"start_book|{ev}",
+            )]
+            for ev in remaining_bookable
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text += "\n\n✨ **Куда ещё можно записаться:**"
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="Markdown")
+    elif not remaining_full:
+        text += "\n\n🎉 **Вы записаны на все активности! Отличный день!**"
+        await bot.send_message(chat_id, text, parse_mode="Markdown")
+    else:
+        text += "\n\n_На остальные активности мест пока нет — попробуйте позже_ 🤞"
+        await bot.send_message(chat_id, text, parse_mode="Markdown")
 
 
 async def send_reminder(user_id, event_name, time_str):
@@ -587,8 +723,6 @@ async def execute_booking(
     if not valid:
         return {"ok": False, "text": err}
 
-    # User lock — сериализует ВСЕ записи одного пользователя
-    # Event lock — сериализует записи в один слот мероприятия
     async with get_user_lock(uid):
         async with get_lock(event):
             records = _sheet_cache.get(event, [])
@@ -604,19 +738,18 @@ async def execute_booking(
                 )
                 return {
                     "ok": False,
-                    "text": f"❌ Вы уже записаны {ef(event, 'to')} (время: {bt}).",
+                    "text": f"Вы уже записаны {ef(event, 'to')} на **{bt}** ✅\n"
+                            f"_Чтобы перенести, напишите «перенеси {ef(event, 'acc')}»_",
                 }
 
-            # Конфликт теперь проверяется АТОМАРНО —
-            # user lock гарантирует что другая запись этого же юзера
-            # не проскочит между check и write
             conflict, c_ev, c_t = check_time_conflict(
                 event, time_str, get_all_user_bookings(uid)
             )
             if conflict:
                 return {
                     "ok": False,
-                    "text": f"Ой, накладочка! В {time_str} вы будете {ef(c_ev, 'at')}.",
+                    "text": f"⚠️ Накладка: в **{time_str}** вы будете {ef(c_ev, 'at')}.\n"
+                            f"_Выберите другое время_ 🕐",
                 }
 
             at_time = [r for r in records if str(r.get("Время", "")) == time_str]
@@ -669,7 +802,7 @@ async def execute_booking(
             )
             _sheet_cache[event].append(new_record)
 
-    # Напоминание — вне локов
+    # Напоминание
     now = datetime.now()
     ev_t = datetime.strptime(time_str, "%H:%M").replace(
         year=now.year, month=now.month, day=now.day
@@ -682,12 +815,99 @@ async def execute_booking(
             id=f"{uid}_{event}", replace_existing=True,
         )
 
-    msg = f"🎉 Вы успешно записаны {ef(event, 'to')} в **{time_str}**!"
+    icon = EVENT_ICONS.get(event, "✨")
+    end_time = (
+        datetime.strptime(time_str, "%H:%M") + timedelta(minutes=cfg["duration"])
+    ).strftime("%H:%M")
+
+    msg_lines = [
+        f"{'🔄 Перенесено' if is_reschedule else '✅ Записано'}!",
+        "",
+        f"  {icon}  **{ef(event)}**",
+        f"  🕐  **{time_str} — {end_time}**",
+    ]
     if master:
-        msg += f"\nСпециалист: **{master['label']}**"
+        msg_lines.append(f"  👩‍⚕️  {master['label']}")
         if master.get("location"):
-            msg += f"\n📍 {master['location']}"
-    return {"ok": True, "text": msg}
+            msg_lines.append(f"  📍  {master['location']}")
+    if event in ("нутрициолог", "семейный нутрициолог"):
+        msg_lines.append(f"  📍  Зал совещаний, 5 этаж")
+
+    msg_lines.append("")
+    msg_lines.append("_Напомню за 3 минуты до начала_ 🔔")
+
+    return {"ok": True, "text": "\n".join(msg_lines)}
+
+
+# ══════════════════════════════════════════════     ← FIX: новая функция отмены всех записей
+#  ОТМЕНА ВСЕХ ЗАПИСЕЙ
+# ══════════════════════════════════════════════
+async def cancel_all_bookings(user_id: int) -> str:
+    """Отменяет все записи пользователя. Возвращает текст ответа."""
+    uid = str(user_id)
+    bookings = get_all_user_bookings(uid)
+
+    if not bookings:
+        return "У вас нет активных записей 😊"
+
+    cancelled = []
+    for b in bookings:
+        event = b["event"]
+        async with get_lock(event):
+            records = _sheet_cache.get(event, [])
+            if any(str(r.get("ID", "")) == uid for r in records):
+                def delete_sync(ev=event):
+                    ws = sheet.worksheet(EVENTS_CONFIG[ev]["sheet"])
+                    ids = [str(v) for v in ws.col_values(1)]
+                    if uid in ids:
+                        ws.delete_rows(ids.index(uid) + 1)
+
+                await asyncio.to_thread(delete_sync)
+                _sheet_cache[event] = [
+                    r for r in _sheet_cache[event]
+                    if str(r.get("ID", "")) != uid
+                ]
+                job_id = f"{uid}_{event}"
+                if scheduler.get_job(job_id):
+                    scheduler.remove_job(job_id)
+                icon = EVENT_ICONS.get(event, "✨")
+                cancelled.append(f"  {icon} {ef(event)} ({b['time']})")
+
+    if cancelled:
+        lines = ["🗑 **Все записи отменены:**", ""] + cancelled
+        return "\n".join(lines)
+    return "У вас нет активных записей 😊"
+
+
+# ══════════════════════════════════════════════     ← FIX: новая функция — клавиатура для выбора записи на отмену
+#  КЛАВИАТУРА ОТМЕНЫ
+# ══════════════════════════════════════════════
+def build_cancel_keyboard(user_id_str: str) -> InlineKeyboardMarkup | None:
+    """Строит клавиатуру с кнопками отмены для каждой записи пользователя."""
+    bookings = get_all_user_bookings(user_id_str)
+    if not bookings:
+        return None
+
+    buttons = []
+    for b in bookings:
+        icon = EVENT_ICONS.get(b["event"], "✨")
+        buttons.append([InlineKeyboardButton(
+            text=f"❌ {icon} {ef(b['event'])} — {b['time']}",
+            callback_data=f"confirm_cancel|{b['event']}",
+        )])
+
+    if len(bookings) > 1:                                              # ← FIX: кнопка «Отменить всё»
+        buttons.append([InlineKeyboardButton(
+            text="🗑 Отменить все записи",
+            callback_data="cancel_all_confirmed",
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        text="← Назад к услугам",
+        callback_data="back_to_services",
+    )])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ══════════════════════════════════════════════
@@ -695,7 +915,6 @@ async def execute_booking(
 # ══════════════════════════════════════════════
 
 def _resolve_event(raw: str | None) -> str | None:
-    """Нормализует название мероприятия."""
     if not raw:
         return None
     key = raw.lower().strip()
@@ -706,50 +925,58 @@ def _resolve_event(raw: str | None) -> str | None:
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    uid = str(message.from_user.id)
     await message.reply(
-        WELCOME_TEXT + "\n**Или выберите услугу для записи:**",
-        reply_markup=build_services_keyboard(),
+        WELCOME_TEXT,
+        reply_markup=build_services_keyboard(user_id=uid),
         parse_mode="Markdown",
     )
 
 
 @dp.message()
 async def handle_booking(message: types.Message, state: FSMContext):
-    # ════════ ДОБАВИТЬ ЭТОТ БЛОК ════════
-    # Ручная проверка команд, чтобы не путать AI
     text_lower = message.text.lower().strip()
+    uid = str(message.from_user.id)
+
     if text_lower in ["моя программа", "мои записи", "расписание", "программа"]:
         await state.clear()
-        uid = str(message.from_user.id)
         text = build_program_message(uid)
         if text:
             await message.reply(text, parse_mode="Markdown")
         else:
             await message.reply(
-                "У вас пока нет записей!",
-                reply_markup=build_services_keyboard(),
+                "У вас пока нет записей 😊\n\n✨ **Выберите услугу:**",
+                reply_markup=build_services_keyboard(user_id=uid),
+                parse_mode="Markdown",
             )
         return
-    # ════════════════════════════════════
+
+    # ── FIX: быстрая проверка на «отмени всё» без GPT ──
+    cancel_all_patterns = [
+        "отмени все", "отмени всё", "отменить все", "отменить всё",
+        "удали все", "удали всё", "отмена всех", "отменить все записи",
+        "удалить все записи", "отмени все записи",
+    ]
+    if text_lower in cancel_all_patterns:
+        await state.clear()
+        result = await cancel_all_bookings(message.from_user.id)
+        await message.reply(result, parse_mode="Markdown")
+        return
 
     current_state = await state.get_state()
     intent = await parse_intent(message.text)
 
-
-    # ── Если мы в режиме ожидания времени и NLP не распознал осмысленный интент ──
+    # ── Режим ожидания времени ──
     if current_state == BookingState.waiting_for_time.state:
+        # ← FIX: расширенный список action'ов, которые прерывают FSM
         has_meaningful_intent = (
             intent
             and intent.get("action")
             and intent.get("action") not in ("book", "reschedule")
         )
-        # Если NLP вернул cancel / my_bookings / info — обрабатываем как новый интент
-        # Иначе пытаемся извлечь время из текста
         if not has_meaningful_intent:
             data = await state.get_data()
-            # Попытка извлечь время из текста
             match = re.search(r"(\d{1,2})[.,:\s-]+(\d{2})", message.text)
-            # Также проверяем, вдруг NLP вернул time
             nlp_time = intent.get("time") if intent else None
 
             if match:
@@ -762,7 +989,7 @@ async def handle_booking(message: types.Message, state: FSMContext):
                 return await message.reply("Действие отменено 😊")
             else:
                 return await message.reply(
-                    "Не могу распознать время 🤔 Напишите в формате ЧЧ:ММ или нажмите кнопку выше."
+                    "Не могу распознать время 🤔\nНапишите в формате ЧЧ:ММ или нажмите кнопку выше."
                 )
 
             event = data.get("event")
@@ -773,7 +1000,7 @@ async def handle_booking(message: types.Message, state: FSMContext):
             if not event or event not in EVENTS_CONFIG:
                 return await message.reply(
                     "Что-то пошло не так. Выберите услугу заново:",
-                    reply_markup=build_services_keyboard(),
+                    reply_markup=build_services_keyboard(user_id=uid),
                 )
 
             res = await execute_booking(
@@ -785,16 +1012,18 @@ async def handle_booking(message: types.Message, state: FSMContext):
             )
             await message.reply(res["text"], parse_mode="Markdown")
             if res["ok"]:
-                await send_program(message.chat.id, str(message.from_user.id))
+                await send_program(message.chat.id, uid)
             return
+        else:                                                           # ← FIX: если meaningful intent — выходим из FSM
+            await state.clear()
 
     # ── Стандартная обработка через NLP ──
-    await state.clear()
+    # (state уже очищен выше или не был установлен)
 
     if not intent or not intent.get("action"):
         return await message.reply(
-            WELCOME_TEXT + "\n**Или выберите услугу для записи:**",
-            reply_markup=build_services_keyboard(),
+            WELCOME_TEXT,
+            reply_markup=build_services_keyboard(user_id=uid),
             parse_mode="Markdown",
         )
 
@@ -803,7 +1032,12 @@ async def handle_booking(message: types.Message, state: FSMContext):
     event = EVENT_ALIASES.get(raw_event, raw_event)
     time_str = intent.get("time")
     preferred_master = intent.get("preferred_master")
-    uid = str(message.from_user.id)
+
+    # ── FIX: Отмена всех записей (через GPT) ──
+    if action == "cancel_all":
+        result = await cancel_all_bookings(message.from_user.id)
+        await message.reply(result, parse_mode="Markdown")
+        return
 
     # ── Мои записи ──
     if action == "my_bookings":
@@ -812,45 +1046,118 @@ async def handle_booking(message: types.Message, state: FSMContext):
             await message.reply(text, parse_mode="Markdown")
         else:
             await message.reply(
-                "У вас пока нет записей!",
-                reply_markup=build_services_keyboard(),
+                "У вас пока нет записей 😊\n\n✨ **Выберите услугу:**",
+                reply_markup=build_services_keyboard(user_id=uid),
+                parse_mode="Markdown",
             )
         return
 
     # ── Инфо ──
     if action == "info":
         if event in EVENTS_CONFIG:
-            cfg = EVENTS_CONFIG[event]
-            text = f"ℹ️ {cfg['desc']}\n⏰ {cfg['start']} — {cfg['end']}"
-            suggested = get_suggested_slots(
-                event, _sheet_cache.get(event, []), preferred_master
-            )
+            card = build_service_card(event)
+            records = _sheet_cache.get(event, [])
+            already_booked = any(str(r.get("ID", "")) == uid for r in records)
+
+            if already_booked:
+                user_rec = next(r for r in records if str(r.get("ID", "")) == uid)
+                bt = str(user_rec.get("Время", ""))
+                card += f"\n\n✅ **Вы уже записаны на {bt}**"
+                buttons = [
+                    [InlineKeyboardButton(
+                        text="🔄 Перенести",
+                        callback_data=f"start_reschedule|{event}",
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Отменить",
+                        callback_data=f"confirm_cancel|{event}",
+                    )],
+                    [InlineKeyboardButton(
+                        text="← Назад к услугам",
+                        callback_data="back_to_services",
+                    )],
+                ]
+                return await message.reply(
+                    card,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                    parse_mode="Markdown",
+                )
+
+            suggested = get_suggested_slots(event, records, preferred_master)
             if suggested:
                 await state.update_data(
                     action="book", event=event, preferred_master=preferred_master
                 )
                 await state.set_state(BookingState.waiting_for_time)
                 return await message.reply(
-                    text + "\n✨ Свободные окошки:",
+                    card + "\n\n🕐 **Выберите время:**",
                     reply_markup=build_slot_keyboard(event, suggested, "book"),
+                    parse_mode="Markdown",
                 )
-            return await message.reply(text + "\nК сожалению, мест нет 😔")
+            return await message.reply(
+                card + "\n\nК сожалению, мест нет 😔",
+                parse_mode="Markdown",
+            )
         return await message.reply(
-            "Выберите услугу:", reply_markup=build_services_keyboard()
+            "✨ **Выберите услугу:**",
+            reply_markup=build_services_keyboard(user_id=uid),
+            parse_mode="Markdown",
         )
 
-    # ── Проверяем, что мероприятие известно ──
+    # ── FIX: cancel без конкретного event — показать список записей для отмены ──
+    if action == "cancel" and event not in EVENTS_CONFIG:
+        bookings = get_all_user_bookings(uid)
+        if not bookings:
+            return await message.reply("У вас нет активных записей 😊")
+        if len(bookings) == 1:
+            # Одна запись — отменяем сразу
+            single_event = bookings[0]["event"]
+            async with get_lock(single_event):
+                records = _sheet_cache.get(single_event, [])
+                if any(str(r.get("ID", "")) == uid for r in records):
+                    def delete_sync():
+                        ws = sheet.worksheet(EVENTS_CONFIG[single_event]["sheet"])
+                        ids = [str(v) for v in ws.col_values(1)]
+                        if uid in ids:
+                            ws.delete_rows(ids.index(uid) + 1)
+
+                    await asyncio.to_thread(delete_sync)
+                    _sheet_cache[single_event] = [
+                        r for r in _sheet_cache[single_event]
+                        if str(r.get("ID", "")) != uid
+                    ]
+                    job_id = f"{uid}_{single_event}"
+                    if scheduler.get_job(job_id):
+                        scheduler.remove_job(job_id)
+                    await message.reply(
+                        f"🗑 Запись {ef(single_event, 'to')} отменена."
+                    )
+                    await send_program(message.chat.id, uid)
+                else:
+                    await message.reply("У вас нет активных записей 😊")
+            return
+
+        # Несколько записей — показать клавиатуру выбора
+        kb = build_cancel_keyboard(uid)
+        return await message.reply(
+            "❌ **Какую запись отменить?**",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+
+    # ── Мероприятие не распознано (для book/reschedule/availability) ──
     if event not in EVENTS_CONFIG:
-        text = (
-            "Уточните, пожалуйста, на какую услугу записаться? ✨\n\n👇 **Выберите:**"
-            if action in ("book", "reschedule", "cancel", "availability")
-            else WELCOME_TEXT + "\n**Или выберите услугу:**"
-        )
+        if action in ("book", "reschedule"):
+            text = "Уточните, на какую услугу записаться? ✨\n\n👇 **Выберите:**"
+        elif action == "availability":
+            text = "Уточните, по какой услуге проверить наличие? ✨\n\n👇 **Выберите:**"
+        else:
+            text = WELCOME_TEXT
         return await message.reply(
-            text, reply_markup=build_services_keyboard(), parse_mode="Markdown"
+            text, reply_markup=build_services_keyboard(user_id=uid), parse_mode="Markdown"
         )
 
-    # ── Отмена ──
+    # ── Отмена конкретной услуги ──
     if action == "cancel":
         async with get_lock(event):
             records = _sheet_cache.get(event, [])
@@ -878,9 +1185,9 @@ async def handle_booking(message: types.Message, state: FSMContext):
     # ── Наличие мест ──
     if action == "availability":
         records = _sheet_cache.get(event, [])
+        card = build_service_card(event)
         avail_list = get_available_slots(event, records, preferred_master)
         if avail_list:
-            text = f"📅 Свободные окошки {ef(event, 'at')}:\n{format_slots_message(avail_list)}"
             suggested = get_suggested_slots(event, records, preferred_master)
             if suggested:
                 await state.update_data(
@@ -888,17 +1195,17 @@ async def handle_booking(message: types.Message, state: FSMContext):
                 )
                 await state.set_state(BookingState.waiting_for_time)
                 return await message.reply(
-                    text + "\n\n✨ Хотите записаться?",
+                    card + "\n\n✨ **Записаться?**",
                     reply_markup=build_slot_keyboard(event, suggested, "book"),
+                    parse_mode="Markdown",
                 )
-            return await message.reply(text)
+            return await message.reply(card, parse_mode="Markdown")
         return await message.reply(
-            f"Нет свободных окошек {ef(event, 'at')} 😔"
+            card + "\n\nСвободных мест нет 😔", parse_mode="Markdown"
         )
 
     # ── Бронирование / перенос без указанного времени ──
     if not time_str:
-        # Для мероприятий с fixed_time — бронируем сразу
         cfg = EVENTS_CONFIG[event]
         if "fixed_time" in cfg:
             time_str = cfg["fixed_time"]
@@ -906,13 +1213,15 @@ async def handle_booking(message: types.Message, state: FSMContext):
             records = _sheet_cache.get(event, [])
             suggested = get_suggested_slots(event, records, preferred_master)
             if suggested:
+                card = build_service_card(event)
                 await state.update_data(
                     action=action, event=event, preferred_master=preferred_master
                 )
                 await state.set_state(BookingState.waiting_for_time)
                 return await message.reply(
-                    f"Выберите время {ef(event, 'to')} 🕒",
+                    card + "\n\n🕐 **Выберите время:**",
                     reply_markup=build_slot_keyboard(event, suggested, action),
+                    parse_mode="Markdown",
                 )
             return await message.reply(
                 f"Нет свободных окошек {ef(event, 'at')} 😔"
@@ -939,7 +1248,6 @@ async def handle_booking(message: types.Message, state: FSMContext):
 async def process_slot(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     parts = callback.data.split("|")
-    # slot|event|time|action
     event = parts[1]
     time_str = parts[2]
     action = parts[3] if len(parts) > 3 else "book"
@@ -973,28 +1281,35 @@ async def process_slot(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("start_book|"))
 async def process_start_book(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.clear()  # FIX: чистим предыдущий стейт
+    await state.clear()
     event = callback.data.split("|")[1]
+    uid = str(callback.from_user.id)
 
     if event not in EVENTS_CONFIG:
         return await callback.message.edit_text("Услуга не найдена 😔")
 
+    records = _sheet_cache.get(event, [])
+    already = any(str(r.get("ID", "")) == uid for r in records)
+    if already:
+        bt = next((r.get("Время", "") for r in records if str(r.get("ID", "")) == uid), "?")
+        await callback.message.edit_text(
+            f"Вы уже записаны {ef(event, 'to')} на **{bt}** ✅\n"
+            f"_Чтобы перенести, напишите «перенеси {ef(event, 'acc')}»_",
+            parse_mode="Markdown",
+        )
+        return
+
     cfg = EVENTS_CONFIG[event]
 
-    # FIX: для fixed_time — бронируем сразу, без показа кнопок
     if "fixed_time" in cfg:
         time_str = cfg["fixed_time"]
-        records = _sheet_cache.get(event, [])
         at_time = [r for r in records if str(r.get("Время", "")) == time_str]
         avail = cfg["capacity"] - len(at_time)
         if avail <= 0:
             return await callback.message.edit_text(
                 f"К сожалению, мест {ef(event, 'at')} больше нет 😔"
             )
-
-        await callback.message.edit_text(
-            f"⏳ Записываю {ef(event, 'to')} на {time_str}…"
-        )
+        await callback.message.edit_text(f"⏳ Записываю {ef(event, 'to')}…")
         try:
             res = await execute_booking(
                 callback.from_user.id,
@@ -1004,37 +1319,179 @@ async def process_start_book(callback: types.CallbackQuery, state: FSMContext):
             )
             await callback.message.edit_text(res["text"], parse_mode="Markdown")
             if res["ok"]:
-                await send_program(
-                    callback.message.chat.id, str(callback.from_user.id)
-                )
-        except Exception as e:
+                await send_program(callback.message.chat.id, uid)
+        except Exception:
             logging.exception("Ошибка при бронировании fixed_time")
             await callback.message.edit_text(
                 "Произошла ошибка при записи 😔 Попробуйте ещё раз."
             )
         return
 
-    # Обычный поток — показываем слоты
-    suggested = get_suggested_slots(event, _sheet_cache.get(event, []))
+    suggested = get_suggested_slots(event, records)
     if suggested:
+        card = build_service_card(event)
         await state.update_data(action="book", event=event)
         await state.set_state(BookingState.waiting_for_time)
         await callback.message.edit_text(
-            f"Выберите время {ef(event, 'to')} 🕒",
+            card + "\n\n🕐 **Выберите удобное время:**",
             reply_markup=build_slot_keyboard(event, suggested, "book"),
+            parse_mode="Markdown",
         )
     else:
-        await callback.message.edit_text("К сожалению, мест нет 😔")
+        await callback.message.edit_text(
+            f"{EVENT_ICONS.get(event, '✨')} **{ef(event)}**\n\nК сожалению, все места заняты 😔",
+            parse_mode="Markdown",
+        )
+
+
+@dp.callback_query(F.data.startswith("my_booking_detail|"))
+async def process_booking_detail(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    event = callback.data.split("|")[1]
+    uid = str(callback.from_user.id)
+    records = _sheet_cache.get(event, [])
+    user_rec = next((r for r in records if str(r.get("ID", "")) == uid), None)
+
+    if not user_rec:
+        return await callback.message.edit_text(
+            f"Запись {ef(event, 'to')} не найдена 🤔",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="← Назад", callback_data="back_to_services")]
+            ]),
+        )
+
+    time_str = str(user_rec.get("Время", ""))
+    master_id = str(user_rec.get("Мастер/Детали", ""))
+    icon = EVENT_ICONS.get(event, "✨")
+    cfg = EVENTS_CONFIG[event]
+    end_time = (
+        datetime.strptime(time_str, "%H:%M") + timedelta(minutes=cfg["duration"])
+    ).strftime("%H:%M")
+
+    lines = [
+        f"{icon} **{ef(event)}**",
+        f"🕐 **{time_str} — {end_time}**",
+    ]
+    if event in MASTERS_CONFIG and master_id:
+        for m in MASTERS_CONFIG[event]:
+            if m["id"] == master_id:
+                lines.append(f"👩‍⚕️ {m['label']}")
+                if m.get("location"):
+                    lines.append(f"📍 {m['location']}")
+    if event in ("нутрициолог", "семейный нутрициолог"):
+        lines.append("📍 Зал совещаний, 5 этаж")
+
+    buttons = [
+        [
+            InlineKeyboardButton(text="🔄 Перенести", callback_data=f"start_reschedule|{event}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"confirm_cancel|{event}"),
+        ],
+        [InlineKeyboardButton(text="← Назад к услугам", callback_data="back_to_services")],
+    ]
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_cancel|"))
+async def process_confirm_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    event = callback.data.split("|")[1]
+    uid = str(callback.from_user.id)
+
+    async with get_lock(event):
+        records = _sheet_cache.get(event, [])
+        if any(str(r.get("ID", "")) == uid for r in records):
+            def delete_sync():
+                ws = sheet.worksheet(EVENTS_CONFIG[event]["sheet"])
+                ids = [str(v) for v in ws.col_values(1)]
+                if uid in ids:
+                    ws.delete_rows(ids.index(uid) + 1)
+
+            await asyncio.to_thread(delete_sync)
+            _sheet_cache[event] = [
+                r for r in _sheet_cache[event] if str(r.get("ID", "")) != uid
+            ]
+            job_id = f"{uid}_{event}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+            await callback.message.edit_text(f"🗑 Запись {ef(event, 'to')} отменена.")
+            await send_program(callback.message.chat.id, uid)
+        else:
+            await callback.message.edit_text(f"У вас нет записи {ef(event, 'to')} 😊")
+
+
+# ── FIX: callback для «Отменить все записи» ──
+@dp.callback_query(F.data == "cancel_all_confirmed")
+async def process_cancel_all_confirmed(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    result = await cancel_all_bookings(callback.from_user.id)
+    await callback.message.edit_text(result, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("start_reschedule|"))
+async def process_start_reschedule(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    event = callback.data.split("|")[1]
+
+    records = _sheet_cache.get(event, [])
+    suggested = get_suggested_slots(event, records)
+    if suggested:
+        card = build_service_card(event)
+        await state.update_data(action="reschedule", event=event)
+        await state.set_state(BookingState.waiting_for_time)
+        await callback.message.edit_text(
+            f"🔄 **Перенос записи**\n\n{card}\n\n🕐 **Выберите новое время:**",
+            reply_markup=build_slot_keyboard(event, suggested, "reschedule"),
+            parse_mode="Markdown",
+        )
+    else:
+        await callback.message.edit_text(
+            f"Нет свободных окошек для переноса 😔",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="← Назад", callback_data="back_to_services")]
+            ]),
+        )
+
+
+@dp.callback_query(F.data == "back_to_services")
+async def process_back_to_services(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    uid = str(callback.from_user.id)
+    await callback.message.edit_text(
+        "✨ **Выберите услугу:**",
+        reply_markup=build_services_keyboard(user_id=uid),
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data.startswith("no_slots|"))
+async def process_no_slots(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer(
+        "К сожалению, все места заняты 😔 Попробуйте позже!",
+        show_alert=True,
+    )
 
 
 # ══════════════════════════════════════════════
 #  ЗАПУСК
 # ══════════════════════════════════════════════
 async def main():
+    health_runner = await start_health_server()
+
     await sync_cache_with_google()
     scheduler.add_job(background_sync, "interval", minutes=2)
     scheduler.start()
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await health_runner.cleanup()
 
 
 if __name__ == "__main__":

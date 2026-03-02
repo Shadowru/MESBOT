@@ -7,23 +7,13 @@ import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from datetime import datetime, timedelta
 
-# ─── Перед импортом бота мокаем внешние зависимости ───
-# Чтобы при импорте не подключались реальные сервисы
-
 import sys
 import os
-
-# Устанавливаем env-переменные до импорта
-#os.environ.setdefault("TELEGRAM_TOKEN", "fake:token")
-#os.environ.setdefault("OPENAI_API_KEY", "fake-key")
-#os.environ.setdefault("GOOGLE_SHEET_URL", "https://docs.google.com/spreadsheets/d/fake")
-#os.environ.setdefault("GOOGLE_CREDS_PATH", "fake_creds.json")
 
 
 @pytest.fixture(autouse=True)
 def _patch_externals(monkeypatch):
     """Мокаем все внешние вызовы на уровне модуля до каждого теста."""
-    # Google Sheets
     mock_worksheet = MagicMock()
     mock_worksheet.get_all_records.return_value = []
     mock_worksheet.col_values.return_value = []
@@ -36,18 +26,16 @@ def _patch_externals(monkeypatch):
     import bot as bot_module
     monkeypatch.setattr(bot_module, "sheet", mock_sheet)
 
-    # Scheduler
     mock_scheduler = MagicMock()
     mock_scheduler.get_job.return_value = None
     monkeypatch.setattr(bot_module, "scheduler", mock_scheduler)
 
-    # Bot
     mock_bot = AsyncMock()
     monkeypatch.setattr(bot_module, "bot", mock_bot)
 
-    # Очищаем кэш и блокировки
     bot_module._sheet_cache.clear()
     bot_module._booking_locks.clear()
+    bot_module._user_locks.clear()
 
     yield {
         "worksheet": mock_worksheet,
@@ -75,13 +63,14 @@ from bot import (
     build_program_message,
     build_slot_keyboard,
     build_services_keyboard,
+    build_service_card,
     execute_booking,
     send_program,
     EVENTS_CONFIG,
     MASTERS_CONFIG,
     EVENT_ALIASES,
+    SERVICE_DESCRIPTIONS,
     BookingState,
-    _slot_button_label,
 )
 
 
@@ -204,22 +193,19 @@ class TestGetSlotList:
         assert slots == ["11:00", "12:00", "14:00", "15:00", "16:00"]
 
     def test_generated_slots_massage(self):
-        # Массаж: 11:00–17:10, шаг 10 мин
         slots = get_slot_list("массаж")
         assert slots[0] == "11:00"
         assert slots[1] == "11:10"
         assert "17:00" in slots
-        assert "17:10" not in slots  # end is exclusive
+        assert "17:10" not in slots
 
     def test_generated_slots_aroma(self):
-        # 14:00–17:00, шаг 10
         slots = get_slot_list("аромапсихолог")
         assert slots[0] == "14:00"
         assert slots[-1] == "16:50"
-        assert len(slots) == 18  # (17:00 - 14:00) * 6 = 18
+        assert len(slots) == 18
 
     def test_generated_slots_makiyazh(self):
-        # 10:00–12:00, шаг 10
         slots = get_slot_list("макияж")
         assert slots[0] == "10:00"
         assert slots[-1] == "11:50"
@@ -303,10 +289,9 @@ class TestFindAvailableMaster:
         assert master is None
 
     def test_master_on_break(self):
-        # Виктор has breaks at 13:30, 13:40
         master, err = find_available_master("массаж", "13:30", [])
         assert master is not None
-        assert master["id"] != "Мастер №1 Виктор"  # should skip
+        assert master["id"] != "Мастер №1 Виктор"
 
     def test_preferred_master_available(self):
         master, err = find_available_master("массаж", "11:00", [], "Ольга")
@@ -336,7 +321,6 @@ class TestFindAvailableMaster:
         assert master is None
 
     def test_makiyazh_four_masters(self):
-        # 4 визажиста
         master, err = find_available_master("макияж", "10:00", [])
         assert master is not None
         assert "Визажист" in master["id"]
@@ -356,7 +340,6 @@ class TestCountAvailableMasters:
         assert count_available_masters("массаж", "11:00", busy) == 2
 
     def test_with_breaks(self):
-        # At 13:30 Виктор is on break
         assert count_available_masters("массаж", "13:30", []) == 2
 
     def test_preferred_filter(self):
@@ -385,7 +368,6 @@ class TestGetSuggestedSlots:
         slots = get_suggested_slots("массаж", [])
         assert len(slots) > 0
         assert len(slots) <= 6
-        # Каждый элемент - (time_str, avail_count)
         for t, a in slots:
             assert a > 0
 
@@ -395,7 +377,6 @@ class TestGetSuggestedSlots:
             assert slots[i][1] >= slots[i + 1][1] or slots[i][0] <= slots[i + 1][0]
 
     def test_fully_booked_slot_excluded(self):
-        # Забиваем все 3 мастера на 11:00
         records = [
             {"Время": "11:00", "Мастер/Детали": "Мастер №1 Виктор", "ID": "1"},
             {"Время": "11:00", "Мастер/Детали": "Мастер №2 Нарек", "ID": "2"},
@@ -421,7 +402,6 @@ class TestGetSuggestedSlots:
         assert len(slots) <= 2
 
     def test_aroma_capacity_1(self):
-        # Аромапсихолог: capacity=1
         records = [{"Время": "14:00", "ID": "1"}]
         slots = get_suggested_slots("аромапсихолог", records)
         times = [t for t, _ in slots]
@@ -456,6 +436,64 @@ class TestFormatSlotsMessage:
         slots = [f"{i}:00" for i in range(20)]
         result = format_slots_message(slots)
         assert "и другие" in result
+
+
+# ╔══════════════════════════════════════════════╗
+# ║  4b. RICH-КАРТОЧКА УСЛУГИ                   ║
+# ╚══════════════════════════════════════════════╝
+
+
+class TestBuildServiceCard:
+    def test_contains_title(self):
+        bot_module._sheet_cache = {"массаж": []}
+        card = build_service_card("массаж")
+        assert "Массаж" in card
+
+    def test_contains_description(self):
+        bot_module._sheet_cache = {"массаж": []}
+        card = build_service_card("массаж")
+        desc = SERVICE_DESCRIPTIONS["массаж"]
+        assert desc in card
+
+    def test_contains_time_range(self):
+        bot_module._sheet_cache = {"массаж": []}
+        card = build_service_card("массаж")
+        assert "11:00" in card
+        assert "17:10" in card
+
+    def test_contains_duration(self):
+        bot_module._sheet_cache = {"массаж": []}
+        card = build_service_card("массаж")
+        assert "10 мин" in card
+
+    def test_shows_masters_count(self):
+        bot_module._sheet_cache = {"массаж": []}
+        card = build_service_card("массаж")
+        assert "3 мастера" in card
+
+    def test_shows_slots_availability(self):
+        bot_module._sheet_cache = {"массаж": []}
+        card = build_service_card("массаж")
+        assert "Свободно" in card
+
+    def test_fixed_time_shows_places(self):
+        bot_module._sheet_cache = {"нутрициолог": []}
+        card = build_service_card("нутрициолог")
+        assert "30 мест" in card or "Осталось" in card
+
+    def test_no_slots_shows_warning(self):
+        all_slots = get_slot_list("аромапсихолог")
+        records = [
+            {"ID": i, "Время": s, "Мастер/Детали": "Записано"}
+            for i, s in enumerate(all_slots)
+        ]
+        bot_module._sheet_cache = {"аромапсихолог": records}
+        card = build_service_card("аромапсихолог")
+        assert "нет" in card.lower() or "⛔" in card
+
+    def test_all_events_have_descriptions(self):
+        for event in EVENTS_CONFIG:
+            assert event in SERVICE_DESCRIPTIONS, f"Нет описания для {event}"
 
 
 # ╔══════════════════════════════════════════════╗
@@ -514,29 +552,22 @@ class TestCheckTimeConflict:
         assert conflict is False
 
     def test_overlap_conflict(self):
-        # Макияж 10:00 (10 мин) → 10:00–10:10
-        # Массаж 10:05 → overlap
         existing = [{"event": "макияж", "time": "10:00", "duration": 10}]
         conflict, ev, t = check_time_conflict("массаж", "10:05", existing)
         assert conflict is True
         assert ev == "макияж"
 
     def test_adjacent_no_conflict(self):
-        # Макияж 10:00 (10 мин) → ends at 10:10
-        # Массаж 10:10 → no overlap
         existing = [{"event": "макияж", "time": "10:00", "duration": 10}]
         conflict, _, _ = check_time_conflict("массаж", "10:10", existing)
         assert conflict is False
 
     def test_long_event_conflict(self):
-        # Нутрициолог 15:00 (90 мин) → 15:00–16:30
-        # Мастерская 16:00 (60 мин) → overlap
         existing = [{"event": "нутрициолог", "time": "15:00", "duration": 90}]
         conflict, _, _ = check_time_conflict("мастерская чехова", "16:00", existing)
         assert conflict is True
 
     def test_same_event_skipped(self):
-        # Same event is ignored (handled by duplicate check)
         existing = [{"event": "массаж", "time": "11:00", "duration": 10}]
         conflict, _, _ = check_time_conflict("массаж", "11:00", existing)
         assert conflict is False
@@ -572,7 +603,17 @@ class TestBuildProgramMessage:
         assert "бьюти-программа" in text
         assert "11:00" in text
         assert "10:00" in text
-        assert "2/" in text  # 2 bookings out of total
+        # UPDATED: новый формат прогресса «2 из 7»
+        assert "2 из" in text
+
+    def test_contains_progress_bar(self):
+        """Новый формат с прогресс-баром ●○."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        text = build_program_message("123")
+        assert "●" in text
+        assert "○" in text
 
     def test_sorted_by_time(self):
         bot_module._sheet_cache = {
@@ -580,7 +621,6 @@ class TestBuildProgramMessage:
             "макияж": [{"ID": 123, "Время": "10:00", "Мастер/Детали": "V1"}],
         }
         text = build_program_message("123")
-        # 10:00 should appear before 12:00
         assert text.index("10:00") < text.index("12:00")
 
     def test_master_location_shown(self):
@@ -589,7 +629,7 @@ class TestBuildProgramMessage:
         }
         text = build_program_message("123")
         assert "Юлия" in text
-        assert "614а" in text  # Юлия's location
+        assert "614а" in text
 
     def test_nutricionist_location(self):
         bot_module._sheet_cache = {
@@ -608,9 +648,18 @@ class TestBuildSlotKeyboard:
     def test_basic(self):
         suggested = [("11:00", 3), ("11:10", 2)]
         kb = build_slot_keyboard("массаж", suggested, "book")
-        assert len(kb.inline_keyboard) == 2
+        # UPDATED: +1 для кнопки «← Назад к услугам»
+        assert len(kb.inline_keyboard) == 3
         assert "11:00" in kb.inline_keyboard[0][0].text
         assert kb.inline_keyboard[0][0].callback_data == "slot|массаж|11:00|book"
+
+    def test_has_back_button(self):
+        """Новая кнопка «← Назад к услугам»."""
+        suggested = [("11:00", 3)]
+        kb = build_slot_keyboard("массаж", suggested, "book")
+        last_row = kb.inline_keyboard[-1]
+        assert last_row[0].callback_data == "back_to_services"
+        assert "Назад" in last_row[0].text
 
     def test_reschedule_action(self):
         suggested = [("11:00", 1)]
@@ -627,28 +676,73 @@ class TestBuildSlotKeyboard:
         kb = build_slot_keyboard("аромапсихолог", suggested)
         assert "место" in kb.inline_keyboard[0][0].text
 
+    def test_slot_label_format(self):
+        """Новый формат: «🕐 11:00  ·  3 мастера»."""
+        suggested = [("11:00", 3)]
+        kb = build_slot_keyboard("массаж", suggested)
+        text = kb.inline_keyboard[0][0].text
+        assert "🕐" in text
+        assert "·" in text
+
 
 class TestBuildServicesKeyboard:
     def test_has_all_events(self):
+        """Без user_id — все мероприятия видны."""
         kb = build_services_keyboard()
         assert len(kb.inline_keyboard) == len(EVENTS_CONFIG)
 
-    def test_callback_data_format(self):
+    def test_no_user_id_all_bookable(self):
+        """Без user_id — все кнопки start_book (нет ✅/⛔)."""
         kb = build_services_keyboard()
         for row in kb.inline_keyboard:
-            assert row[0].callback_data.startswith("start_book|")
+            cb = row[0].callback_data
+            assert cb.startswith("start_book|") or cb.startswith("no_slots|")
 
+    def test_already_booked_shows_checkmark(self):
+        """Если пользователь записан — кнопка показывает ✅."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        kb = build_services_keyboard(user_id="123")
+        massage_row = None
+        for row in kb.inline_keyboard:
+            if "массаж" in row[0].callback_data.lower() or "Массаж" in row[0].text:
+                massage_row = row
+                break
+        assert massage_row is not None
+        assert "✅" in massage_row[0].text
+        assert massage_row[0].callback_data.startswith("my_booking_detail|")
 
-class TestSlotButtonLabel:
-    def test_masters_event(self):
-        label = _slot_button_label("массаж", "11:00", 3)
-        assert "свободно" in label
-        assert "мастера" in label
+    def test_no_slots_shows_blocked(self):
+        """Если мест нет — кнопка показывает ⛔."""
+        all_slots = get_slot_list("аромапсихолог")
+        records = [
+            {"ID": i, "Время": s, "Мастер/Детали": "Записано"}
+            for i, s in enumerate(all_slots)
+        ]
+        bot_module._sheet_cache = {"аромапсихолог": records}
+        kb = build_services_keyboard(user_id="999")
+        aroma_row = None
+        for row in kb.inline_keyboard:
+            if "аромапсихолог" in row[0].callback_data or "Аромапсихолог" in row[0].text:
+                aroma_row = row
+                break
+        assert aroma_row is not None
+        assert "⛔" in aroma_row[0].text
+        assert aroma_row[0].callback_data.startswith("no_slots|")
 
-    def test_places_event(self):
-        label = _slot_button_label("аромапсихолог", "14:00", 1)
-        assert "осталось" in label
-        assert "место" in label
+    def test_available_shows_active_button(self):
+        """Если есть места и не записан — обычная кнопка start_book."""
+        bot_module._sheet_cache = {"массаж": []}
+        kb = build_services_keyboard(user_id="999")
+        massage_row = None
+        for row in kb.inline_keyboard:
+            if "start_book|массаж" in row[0].callback_data:
+                massage_row = row
+                break
+        assert massage_row is not None
+        assert "✅" not in massage_row[0].text
+        assert "⛔" not in massage_row[0].text
 
 
 # ╔══════════════════════════════════════════════╗
@@ -664,8 +758,26 @@ class TestExecuteBooking:
         res = await execute_booking(123, "@user", "Test User", "аромапсихолог", "14:00")
         assert res["ok"] is True
         assert "14:00" in res["text"]
-        # Проверяем что кэш обновился
         assert len(bot_module._sheet_cache["аромапсихолог"]) == 1
+
+    async def test_success_text_contains_checkmark(self):
+        """Новый формат: ✅ Записано! вместо «успешно записаны»."""
+        bot_module._sheet_cache = {"аромапсихолог": []}
+        res = await execute_booking(123, "@user", "Test User", "аромапсихолог", "14:00")
+        assert "✅" in res["text"]
+        assert "Записано" in res["text"]
+
+    async def test_success_shows_time_range(self):
+        """Новый формат показывает диапазон: 14:00 — 14:10."""
+        bot_module._sheet_cache = {"аромапсихолог": []}
+        res = await execute_booking(123, "@user", "Test User", "аромапсихолог", "14:00")
+        assert "14:10" in res["text"]  # end time
+
+    async def test_success_shows_reminder_note(self):
+        """Подтверждение содержит напоминание о нотификации."""
+        bot_module._sheet_cache = {"аромапсихолог": []}
+        res = await execute_booking(123, "@user", "Test User", "аромапсихолог", "14:00")
+        assert "Напомню" in res["text"] or "🔔" in res["text"]
 
     async def test_successful_booking_with_master(self):
         """Запись на массаж — должен назначить мастера."""
@@ -698,6 +810,15 @@ class TestExecuteBooking:
         res = await execute_booking(123, "@user", "Test", "массаж", "12:00")
         assert res["ok"] is False
         assert "уже записаны" in res["text"]
+
+    async def test_double_booking_suggests_reschedule(self):
+        """Новый UX: при дубле подсказывает команду переноса."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        res = await execute_booking(123, "@user", "Test", "массаж", "12:00")
+        assert res["ok"] is False
+        assert "перенеси" in res["text"].lower()
 
     async def test_capacity_full_simple_event(self):
         """Аромапсихолог: capacity=1, уже занято."""
@@ -753,14 +874,14 @@ class TestExecuteBooking:
         }
         res = await execute_booking(123, "@user", "Test", "массаж", "11:00")
         assert res["ok"] is False
-        assert "накладочка" in res["text"]
+        # UPDATED: «накладочка» → «Накладка»
+        assert "накладка" in res["text"].lower()
 
     async def test_no_conflict_adjacent_events(self):
         bot_module._sheet_cache = {
             "массаж": [],
             "макияж": [{"ID": 123, "Время": "10:50", "Мастер/Детали": "Визажист №1"}],
         }
-        # Макияж 10:50 (10 мин) → 10:50–11:00. Массаж 11:00 → no overlap
         res = await execute_booking(123, "@user", "Test", "массаж", "11:00")
         assert res["ok"] is True
 
@@ -773,11 +894,20 @@ class TestExecuteBooking:
         )
         assert res["ok"] is True
         assert "12:00" in res["text"]
-        # Проверяем что старая запись удалена
         records = bot_module._sheet_cache["массаж"]
         times = [str(r.get("Время", "")) for r in records if str(r.get("ID", "")) == "123"]
         assert "11:00" not in times
         assert "12:00" in times
+
+    async def test_reschedule_text_format(self):
+        """Перенос показывает «🔄 Перенесено»."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        res = await execute_booking(
+            123, "@user", "Test", "массаж", "12:00", is_reschedule=True
+        )
+        assert "Перенесено" in res["text"]
 
     async def test_reschedule_no_existing_booking(self):
         bot_module._sheet_cache = {"массаж": []}
@@ -798,7 +928,6 @@ class TestExecuteBooking:
         assert res["ok"] is False
 
     async def test_nutricionist_capacity_30(self):
-        """30 мест на нутрициолога."""
         bot_module._sheet_cache = {
             "нутрициолог": [
                 {"ID": i, "Время": "15:00", "Мастер/Детали": "Записано"}
@@ -822,21 +951,17 @@ class TestExecuteBooking:
         bot_module._sheet_cache = {"гадалки": []}
         res = await execute_booking(123, "@user", "Test", "гадалки", "11:00")
         assert res["ok"] is True
-        # Юлия is first, has location
         assert "Юлия" in res["text"] or "Гадалка" in res["text"]
 
     async def test_makiyazh_four_in_one_slot(self):
-        """4 визажиста на один слот — все должны записаться."""
         bot_module._sheet_cache = {"макияж": []}
         for i in range(4):
             res = await execute_booking(100 + i, f"@u{i}", f"User {i}", "макияж", "10:00")
             assert res["ok"] is True
-        # 5-й не должен
         res = await execute_booking(200, "@u5", "User 5", "макияж", "10:00")
         assert res["ok"] is False
 
     async def test_cache_mutation(self):
-        """Проверяем что кэш мутируется правильно."""
         bot_module._sheet_cache = {"аромапсихолог": []}
         res = await execute_booking(123, "@user", "Test", "аромапсихолог", "14:00")
         assert res["ok"] is True
@@ -865,11 +990,11 @@ class TestSendProgram:
         await send_program(123, "123")
         bot_module.bot.send_message.assert_called_once()
         call_args = bot_module.bot.send_message.call_args
-        assert "программа" in call_args.kwargs.get("text", call_args.args[1] if len(call_args.args) > 1 else "").lower() or \
-               "программа" in str(call_args).lower()
+        text = call_args.kwargs.get("text", call_args.args[1] if len(call_args.args) > 1 else "")
+        assert "программа" in text.lower()
 
     async def test_shows_remaining_services_buttons(self):
-        """Если записан не на всё — показывает кнопки для оставшихся."""
+        """Если записан не на всё — показывает кнопки для оставшихся доступных."""
         bot_module._sheet_cache = {
             "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
             "макияж": [],
@@ -883,10 +1008,58 @@ class TestSendProgram:
         call_args = bot_module.bot.send_message.call_args
         kb = call_args.kwargs.get("reply_markup")
         assert kb is not None
-        # Должно быть 6 кнопок (все минус массаж)
+        # 6 кнопок (все минус массаж), только доступные
         assert len(kb.inline_keyboard) == 6
 
+    async def test_all_booked_congratulation(self):
+        """Если записан на всё — поздравление без кнопок."""
+        bot_module._sheet_cache = {
+            ev: [{"ID": 123, "Время": get_slot_list(ev)[0], "Мастер/Детали": "X"}]
+            for ev in EVENTS_CONFIG
+        }
+        await send_program(999, "123")
+        call_args = bot_module.bot.send_message.call_args
+        # FIX: text передаётся позиционно, не через kwargs
+        text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
+        assert "все активности" in text.lower() or "🎉" in text
+        kb = call_args.kwargs.get("reply_markup")
+        assert kb is None
 
+# tests/test_bot.py
+# Заменить test_remaining_full_shows_hint в классе TestSendProgram:
+
+    async def test_remaining_full_shows_hint(self):
+        """Если не записан, но мест нет — подсказка «попробуйте позже»."""
+        bot_module._sheet_cache = {ev: [] for ev in EVENTS_CONFIG}
+        bot_module._sheet_cache["массаж"] = [
+            {"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}
+        ]
+        uid = 500
+        for ev in EVENTS_CONFIG:
+            if ev == "массаж":
+                continue
+            cfg = EVENTS_CONFIG[ev]
+            for slot in get_slot_list(ev):
+                # FIX: для событий с мастерами — заполняем реальными ID
+                if ev in MASTERS_CONFIG:
+                    for m in MASTERS_CONFIG[ev]:
+                        if slot not in m.get("breaks", []):
+                            bot_module._sheet_cache[ev].append(
+                                {"ID": uid, "Время": slot, "Мастер/Детали": m["id"]}
+                            )
+                            uid += 1
+                else:
+                    for _ in range(cfg["capacity"]):
+                        bot_module._sheet_cache[ev].append(
+                            {"ID": uid, "Время": slot, "Мастер/Детали": "Записано"}
+                        )
+                        uid += 1
+
+        await send_program(999, "123")
+        call_args = bot_module.bot.send_message.call_args
+        text = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("text", "")
+        assert "позже" in text.lower() or "нет" in text.lower()
+        
 # ╔══════════════════════════════════════════════╗
 # ║  10. NLP (parse_intent)                      ║
 # ╚══════════════════════════════════════════════╝
@@ -956,9 +1129,7 @@ class TestParseIntent:
 @pytest.mark.asyncio
 class TestConcurrency:
     async def test_concurrent_bookings_no_overbooking(self):
-        """Два пользователя одновременно бронируют аромапсихолога (capacity=1)."""
         bot_module._sheet_cache = {"аромапсихолог": []}
-
         results = await asyncio.gather(
             execute_booking(100, "@a", "A", "аромапсихолог", "14:00"),
             execute_booking(200, "@b", "B", "аромапсихолог", "14:00"),
@@ -969,9 +1140,7 @@ class TestConcurrency:
         assert len(failures) == 1
 
     async def test_concurrent_masters_no_double_assign(self):
-        """Три пользователя одновременно бронируют массаж на одно время (3 мастера)."""
         bot_module._sheet_cache = {"массаж": []}
-
         results = await asyncio.gather(
             execute_booking(100, "@a", "A", "массаж", "11:00"),
             execute_booking(200, "@b", "B", "массаж", "11:00"),
@@ -979,25 +1148,18 @@ class TestConcurrency:
         )
         successes = [r for r in results if r["ok"]]
         assert len(successes) == 3
-
-        # 4-й не должен пройти
         res = await execute_booking(400, "@d", "D", "массаж", "11:00")
         assert res["ok"] is False
 
     async def test_concurrent_masters_unique_assignment(self):
-        """Каждому пользователю назначается уникальный мастер."""
         bot_module._sheet_cache = {"массаж": []}
-
         await asyncio.gather(
             execute_booking(100, "@a", "A", "массаж", "11:00"),
             execute_booking(200, "@b", "B", "массаж", "11:00"),
             execute_booking(300, "@c", "C", "массаж", "11:00"),
         )
-        masters = [
-            r["Мастер/Детали"]
-            for r in bot_module._sheet_cache["массаж"]
-        ]
-        assert len(set(masters)) == 3  # все разные
+        masters = [r["Мастер/Детали"] for r in bot_module._sheet_cache["массаж"]]
+        assert len(set(masters)) == 3
 
 
 # ╔══════════════════════════════════════════════╗
@@ -1023,30 +1185,22 @@ class TestEdgeCases:
         assert res["ok"] is False
 
     async def test_reschedule_then_book_old_slot(self):
-        """Перенос освобождает слот, другой пользователь может занять."""
         bot_module._sheet_cache = {
             "аромапсихолог": [{"ID": 100, "Время": "14:00", "Мастер/Детали": "Записано"}],
         }
-        # User 100 переносит с 14:00 на 14:10
         res = await execute_booking(100, "@a", "A", "аромапсихолог", "14:10", is_reschedule=True)
         assert res["ok"] is True
-
-        # User 200 теперь может занять 14:00
         res = await execute_booking(200, "@b", "B", "аромапсихолог", "14:00")
         assert res["ok"] is True
 
     async def test_all_breaks_covered_massage(self):
-        """Проверяем все перерывы мастеров массажа."""
         bot_module._sheet_cache = {"массаж": []}
-
-        # 13:30 — Виктор на перерыве, но Нарек и Ольга свободны
         res = await execute_booking(100, "@u", "U", "массаж", "13:30")
         assert res["ok"] is True
         rec = bot_module._sheet_cache["массаж"][-1]
         assert rec["Мастер/Детали"] != "Мастер №1 Виктор"
 
     async def test_chekhov_all_custom_slots(self):
-        """Все кастомные слоты мастерской Чехова валидны."""
         for slot in ["11:00", "12:00", "14:00", "15:00", "16:00"]:
             ok, err = is_valid_slot_time("мастерская чехова", slot)
             assert ok is True, f"Slot {slot} should be valid, got error: {err}"
@@ -1056,7 +1210,6 @@ class TestEdgeCases:
         assert ok is False
 
     async def test_string_id_matching(self):
-        """ID может быть int или str в кэше — должно матчиться."""
         bot_module._sheet_cache = {
             "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
         }
@@ -1070,7 +1223,6 @@ class TestEdgeCases:
         assert len(bookings) == 1
 
     async def test_multiple_bookings_different_events(self):
-        """Пользователь может записаться на разные мероприятия."""
         bot_module._sheet_cache = {
             "массаж": [],
             "макияж": [],
@@ -1078,13 +1230,10 @@ class TestEdgeCases:
         }
         r1 = await execute_booking(123, "@u", "U", "массаж", "11:00")
         assert r1["ok"] is True
-
         r2 = await execute_booking(123, "@u", "U", "макияж", "10:00")
         assert r2["ok"] is True
-
         r3 = await execute_booking(123, "@u", "U", "аромапсихолог", "14:00")
         assert r3["ok"] is True
-
         bookings = get_all_user_bookings("123")
         assert len(bookings) == 3
 
@@ -1095,7 +1244,6 @@ class TestEdgeCases:
 
 
 def _make_message(text, user_id=123, username="testuser", full_name="Test User"):
-    """Создаёт мок Message."""
     msg = AsyncMock()
     msg.text = text
     msg.chat = MagicMock(id=user_id)
@@ -1105,7 +1253,6 @@ def _make_message(text, user_id=123, username="testuser", full_name="Test User")
 
 
 def _make_callback(data, user_id=123, username="testuser", full_name="Test User"):
-    """Создаёт мок CallbackQuery."""
     cb = AsyncMock()
     cb.data = data
     cb.from_user = MagicMock(id=user_id, username=username, full_name=full_name)
@@ -1117,7 +1264,6 @@ def _make_callback(data, user_id=123, username="testuser", full_name="Test User"
 
 
 def _make_state(data=None, state_val=None):
-    """Создаёт мок FSMContext."""
     st = AsyncMock()
     st.get_data = AsyncMock(return_value=data or {})
     st.get_state = AsyncMock(return_value=state_val)
@@ -1136,7 +1282,16 @@ class TestCmdStart:
         state.clear.assert_called_once()
         msg.reply.assert_called_once()
         call_text = msg.reply.call_args[0][0]
-        assert "красавицы" in call_text.lower() or "Привет" in call_text
+        # UPDATED: новый WELCOME_TEXT
+        assert "добро пожаловать" in call_text.lower()
+
+    async def test_includes_services_keyboard(self):
+        """Клавиатура передаётся в /start."""
+        msg = _make_message("/start")
+        state = _make_state()
+        await bot_module.cmd_start(msg, state)
+        kb = msg.reply.call_args.kwargs.get("reply_markup")
+        assert kb is not None
 
 
 @pytest.mark.asyncio
@@ -1171,9 +1326,9 @@ class TestHandleBookingHandler:
             await bot_module.handle_booking(msg, state)
 
         msg.reply.assert_called()
-        # Первый вызов — результат бронирования
         first_reply = msg.reply.call_args_list[0][0][0]
-        assert "успешно" in first_reply.lower() or "записан" in first_reply.lower()
+        # UPDATED: «✅ Записано» вместо «успешно записаны»
+        assert "записано" in first_reply.lower() or "записан" in first_reply.lower()
 
     async def test_book_without_time_shows_slots(self):
         bot_module._sheet_cache = {"массаж": []}
@@ -1191,6 +1346,24 @@ class TestHandleBookingHandler:
         state.set_state.assert_called_with(BookingState.waiting_for_time)
         msg.reply.assert_called_once()
         assert msg.reply.call_args.kwargs.get("reply_markup") is not None
+
+    async def test_book_without_time_shows_service_card(self):
+        """При выборе слота отображается rich-карточка услуги."""
+        bot_module._sheet_cache = {"массаж": []}
+        msg = _make_message("хочу на массаж")
+        state = _make_state()
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock(message=MagicMock(
+            content='{"action":"book","event":"массаж","time":"","preferred_master":""}'
+        ))]
+        with patch.object(bot_module.llm_client.chat.completions, "create",
+                          new_callable=AsyncMock, return_value=mock_resp):
+            await bot_module.handle_booking(msg, state)
+
+        reply_text = msg.reply.call_args[0][0]
+        assert "Массаж" in reply_text
+        assert "Выберите" in reply_text or "время" in reply_text.lower()
 
     async def test_cancel_existing(self):
         bot_module._sheet_cache = {
@@ -1228,7 +1401,6 @@ class TestHandleBookingHandler:
         assert "нет записи" in msg.reply.call_args[0][0].lower()
 
     async def test_waiting_for_time_receives_time(self):
-        """В FSM waiting_for_time пользователь вводит время текстом."""
         bot_module._sheet_cache = {"массаж": []}
         msg = _make_message("11:30")
         state = _make_state(
@@ -1289,10 +1461,53 @@ class TestHandleBookingHandler:
 
         msg.reply.assert_called()
         call_text = msg.reply.call_args_list[0][0][0]
-        assert "свободные" in call_text.lower() or "окошк" in call_text.lower()
+        # UPDATED: теперь показывается карточка с «Свободно» и «Записаться?»
+        assert "свободно" in call_text.lower() or "записаться" in call_text.lower()
+
+    async def test_info_action_with_service_card(self):
+        """Info показывает rich-карточку услуги."""
+        bot_module._sheet_cache = {"массаж": []}
+        msg = _make_message("расскажи про массаж")
+        state = _make_state()
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock(message=MagicMock(
+            content='{"action":"info","event":"массаж","time":"","preferred_master":""}'
+        ))]
+        with patch.object(bot_module.llm_client.chat.completions, "create",
+                          new_callable=AsyncMock, return_value=mock_resp):
+            await bot_module.handle_booking(msg, state)
+
+        call_text = msg.reply.call_args[0][0]
+        assert "Массаж" in call_text
+        assert SERVICE_DESCRIPTIONS["массаж"] in call_text
+
+    async def test_info_already_booked_shows_manage_buttons(self):
+        """Если записан — инфо показывает кнопки Перенести/Отменить."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        msg = _make_message("расскажи про массаж")
+        state = _make_state()
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock(message=MagicMock(
+            content='{"action":"info","event":"массаж","time":"","preferred_master":""}'
+        ))]
+        with patch.object(bot_module.llm_client.chat.completions, "create",
+                          new_callable=AsyncMock, return_value=mock_resp):
+            await bot_module.handle_booking(msg, state)
+
+        call_text = msg.reply.call_args[0][0]
+        assert "уже записаны" in call_text.lower() or "✅" in call_text
+        kb = msg.reply.call_args.kwargs.get("reply_markup")
+        assert kb is not None
+        # Должны быть кнопки Перенести и Отменить
+        all_cb = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+        assert any("start_reschedule" in cb for cb in all_cb)
+        assert any("confirm_cancel" in cb for cb in all_cb)
 
     async def test_fixed_time_no_slot_selection(self):
-        """Нутрициолог с fixed_time должен бронироваться сразу."""
         bot_module._sheet_cache = {"нутрициолог": []}
         msg = _make_message("запиши к нутрициологу")
         state = _make_state()
@@ -1308,7 +1523,7 @@ class TestHandleBookingHandler:
         msg.reply.assert_called()
         first_reply = msg.reply.call_args_list[0][0][0]
         assert "15:00" in first_reply
-        assert "успешно" in first_reply.lower() or "записан" in first_reply.lower()
+        assert "записано" in first_reply.lower() or "записан" in first_reply.lower()
 
     async def test_unknown_event_shows_services(self):
         msg = _make_message("запиши на пилатес")
@@ -1342,10 +1557,9 @@ class TestProcessSlot:
 
         cb.answer.assert_called_once()
         state.clear.assert_called_once()
-        # edit_text called twice: loading + result
         assert cb.message.edit_text.call_count >= 2
         last_text = cb.message.edit_text.call_args_list[-1][0][0]
-        assert "успешно" in last_text.lower() or "записан" in last_text.lower()
+        assert "записано" in last_text.lower() or "записан" in last_text.lower()
 
     async def test_slot_reschedule(self):
         bot_module._sheet_cache = {
@@ -1358,6 +1572,7 @@ class TestProcessSlot:
 
         last_text = cb.message.edit_text.call_args_list[-1][0][0]
         assert "12:00" in last_text
+        assert "Перенесено" in last_text
 
     async def test_slot_booking_failure(self):
         bot_module._sheet_cache = {
@@ -1382,20 +1597,20 @@ class TestProcessSlot:
         assert "Ольга" in last_text
 
     async def test_slot_without_action_defaults_to_book(self):
-        """callback_data без action — старый формат."""
         bot_module._sheet_cache = {"массаж": []}
-        cb = _make_callback("slot|массаж|11:00")  # no action part
+        cb = _make_callback("slot|массаж|11:00")
         state = _make_state(data={})
 
         await bot_module.process_slot(cb, state)
 
         last_text = cb.message.edit_text.call_args_list[-1][0][0]
-        assert "успешно" in last_text.lower() or "записан" in last_text.lower()
+        assert "записано" in last_text.lower() or "записан" in last_text.lower()
 
 
 @pytest.mark.asyncio
 class TestProcessStartBook:
-    async def test_shows_slots(self):
+    async def test_shows_slots_with_service_card(self):
+        """Показывает rich-карточку + слоты."""
         bot_module._sheet_cache = {"массаж": []}
         cb = _make_callback("start_book|массаж")
         state = _make_state()
@@ -1406,11 +1621,27 @@ class TestProcessStartBook:
         state.clear.assert_called()
         state.set_state.assert_called_with(BookingState.waiting_for_time)
         cb.message.edit_text.assert_called()
+        # Текст содержит карточку
+        call_text = cb.message.edit_text.call_args[0][0]
+        assert "Массаж" in call_text
         kb = cb.message.edit_text.call_args.kwargs.get("reply_markup")
         assert kb is not None
 
+    async def test_already_booked_shows_info(self):
+        """Если уже записан — показывает инфо, не создаёт дубль."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        cb = _make_callback("start_book|массаж")
+        state = _make_state()
+
+        await bot_module.process_start_book(cb, state)
+
+        text = cb.message.edit_text.call_args[0][0]
+        assert "уже записаны" in text.lower()
+        assert "11:00" in text
+
     async def test_fixed_time_books_immediately(self):
-        """Нутрициолог fixed_time — бронирует сразу без показа кнопок."""
         bot_module._sheet_cache = {"нутрициолог": []}
         cb = _make_callback("start_book|нутрициолог")
         state = _make_state()
@@ -1418,9 +1649,7 @@ class TestProcessStartBook:
         await bot_module.process_start_book(cb, state)
 
         state.clear.assert_called()
-        # Не должен устанавливать waiting_for_time
         state.set_state.assert_not_called()
-        # Должен вызвать edit_text минимум дважды (loading + result)
         assert cb.message.edit_text.call_count >= 2
         last_text = cb.message.edit_text.call_args_list[-1][0][0]
         assert "15:00" in last_text
@@ -1441,20 +1670,19 @@ class TestProcessStartBook:
         assert "нет" in text.lower() or "мест" in text.lower()
 
     async def test_no_slots_available(self):
-        # Забиваем все слоты аромапсихолога (capacity=1)
         all_slots = get_slot_list("аромапсихолог")
         records = [
             {"ID": i, "Время": s, "Мастер/Детали": "Записано"}
             for i, s in enumerate(all_slots)
         ]
         bot_module._sheet_cache = {"аромапсихолог": records}
-        cb = _make_callback("start_book|аромапсихолог")
+        cb = _make_callback("start_book|аромапсихолог", user_id=999)
         state = _make_state()
 
         await bot_module.process_start_book(cb, state)
 
         text = cb.message.edit_text.call_args[0][0]
-        assert "нет" in text.lower() or "мест" in text.lower()
+        assert "нет" in text.lower() or "мест" in text.lower() or "заняты" in text.lower()
 
     async def test_unknown_event(self):
         cb = _make_callback("start_book|пилатес")
@@ -1466,7 +1694,6 @@ class TestProcessStartBook:
         assert "не найдена" in text.lower()
 
     async def test_clears_previous_state(self):
-        """Если до этого был waiting_for_time — очищается."""
         bot_module._sheet_cache = {"массаж": []}
         cb = _make_callback("start_book|массаж")
         state = _make_state(
@@ -1480,6 +1707,181 @@ class TestProcessStartBook:
 
 
 # ╔══════════════════════════════════════════════╗
+# ║  14b. НОВЫЕ CALLBACK HANDLERS               ║
+# ╚══════════════════════════════════════════════╝
+
+
+@pytest.mark.asyncio
+class TestProcessBookingDetail:
+    """Тест my_booking_detail — тап на ✅ показывает детали записи."""
+
+    async def test_shows_booking_details(self):
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "Мастер №1 Виктор"}],
+        }
+        cb = _make_callback("my_booking_detail|массаж")
+        state = _make_state()
+
+        await bot_module.process_booking_detail(cb, state)
+
+        cb.answer.assert_called_once()
+        text = cb.message.edit_text.call_args[0][0]
+        assert "11:00" in text
+        assert "Массаж" in text
+        assert "Виктор" in text
+
+    async def test_shows_manage_buttons(self):
+        """Показывает кнопки Перенести и Отменить."""
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        cb = _make_callback("my_booking_detail|массаж")
+        state = _make_state()
+
+        await bot_module.process_booking_detail(cb, state)
+
+        kb = cb.message.edit_text.call_args.kwargs.get("reply_markup")
+        assert kb is not None
+        all_cb = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+        assert any("start_reschedule|массаж" in c for c in all_cb)
+        assert any("confirm_cancel|массаж" in c for c in all_cb)
+        assert any("back_to_services" in c for c in all_cb)
+
+    async def test_no_booking_found(self):
+        bot_module._sheet_cache = {"массаж": []}
+        cb = _make_callback("my_booking_detail|массаж")
+        state = _make_state()
+
+        await bot_module.process_booking_detail(cb, state)
+
+        text = cb.message.edit_text.call_args[0][0]
+        assert "не найдена" in text.lower()
+
+    async def test_shows_location_for_gadалки(self):
+        bot_module._sheet_cache = {
+            "гадалки": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "Гадалка Юлия"}],
+        }
+        cb = _make_callback("my_booking_detail|гадалки")
+        state = _make_state()
+
+        await bot_module.process_booking_detail(cb, state)
+
+        text = cb.message.edit_text.call_args[0][0]
+        assert "Юлия" in text
+        assert "614а" in text
+
+
+@pytest.mark.asyncio
+class TestProcessConfirmCancel:
+    """Тест confirm_cancel — отмена через кнопку."""
+
+    async def test_cancels_booking(self):
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        cb = _make_callback("confirm_cancel|массаж")
+        state = _make_state()
+
+        await bot_module.process_confirm_cancel(cb, state)
+
+        cb.answer.assert_called_once()
+        assert len(bot_module._sheet_cache["массаж"]) == 0
+        text = cb.message.edit_text.call_args[0][0]
+        assert "отменена" in text.lower()
+
+    async def test_cancel_nonexistent(self):
+        bot_module._sheet_cache = {"массаж": []}
+        cb = _make_callback("confirm_cancel|массаж")
+        state = _make_state()
+
+        await bot_module.process_confirm_cancel(cb, state)
+
+        text = cb.message.edit_text.call_args[0][0]
+        assert "нет записи" in text.lower()
+
+
+@pytest.mark.asyncio
+class TestProcessStartReschedule:
+    """Тест start_reschedule — перенос через кнопку."""
+
+    async def test_shows_slots_for_reschedule(self):
+        bot_module._sheet_cache = {
+            "массаж": [{"ID": 123, "Время": "11:00", "Мастер/Детали": "M1"}],
+        }
+        cb = _make_callback("start_reschedule|массаж")
+        state = _make_state()
+
+        await bot_module.process_start_reschedule(cb, state)
+
+        cb.answer.assert_called_once()
+        state.set_state.assert_called_with(BookingState.waiting_for_time)
+        text = cb.message.edit_text.call_args[0][0]
+        assert "перенос" in text.lower()
+        kb = cb.message.edit_text.call_args.kwargs.get("reply_markup")
+        assert kb is not None
+        # Кнопки содержат reschedule в callback_data
+        slot_buttons = [
+            btn for row in kb.inline_keyboard for btn in row
+            if btn.callback_data.startswith("slot|")
+        ]
+        assert all("reschedule" in btn.callback_data for btn in slot_buttons)
+
+    async def test_no_slots_for_reschedule(self):
+        """Если нет свободных слотов — сообщение + кнопка Назад."""
+        all_slots = get_slot_list("аромапсихолог")
+        records = [
+            {"ID": i, "Время": s, "Мастер/Детали": "Записано"}
+            for i, s in enumerate(all_slots)
+        ]
+        bot_module._sheet_cache = {"аромапсихолог": records}
+        cb = _make_callback("start_reschedule|аромапсихолог")
+        state = _make_state()
+
+        await bot_module.process_start_reschedule(cb, state)
+
+        text = cb.message.edit_text.call_args[0][0]
+        assert "нет" in text.lower()
+        kb = cb.message.edit_text.call_args.kwargs.get("reply_markup")
+        assert kb is not None
+        assert any("back_to_services" in btn.callback_data
+                    for row in kb.inline_keyboard for btn in row)
+
+
+@pytest.mark.asyncio
+class TestProcessBackToServices:
+    """Тест back_to_services — навигация назад."""
+
+    async def test_shows_services_keyboard(self):
+        cb = _make_callback("back_to_services")
+        state = _make_state()
+
+        await bot_module.process_back_to_services(cb, state)
+
+        cb.answer.assert_called_once()
+        state.clear.assert_called()
+        text = cb.message.edit_text.call_args[0][0]
+        assert "услугу" in text.lower()
+        kb = cb.message.edit_text.call_args.kwargs.get("reply_markup")
+        assert kb is not None
+
+
+@pytest.mark.asyncio
+class TestProcessNoSlots:
+    """Тест no_slots — popup alert вместо нового сообщения."""
+
+    async def test_shows_alert(self):
+        cb = _make_callback("no_slots|аромапсихолог")
+        state = _make_state()
+
+        await bot_module.process_no_slots(cb, state)
+
+        cb.answer.assert_called_once()
+        call_kwargs = cb.answer.call_args.kwargs
+        assert call_kwargs.get("show_alert") is True
+        assert "заняты" in cb.answer.call_args[0][0].lower()
+
+
+# ╔══════════════════════════════════════════════╗
 # ║  15. ПОЛНЫЕ СЦЕНАРИИ (END-TO-END STYLE)     ║
 # ╚══════════════════════════════════════════════╝
 
@@ -1487,31 +1889,23 @@ class TestProcessStartBook:
 @pytest.mark.asyncio
 class TestFullScenarios:
     async def test_book_cancel_rebook(self):
-        """Записаться → отменить → записаться снова."""
         bot_module._sheet_cache = {"аромапсихолог": []}
-
-        # Записываемся
         r1 = await execute_booking(123, "@u", "U", "аромапсихолог", "14:00")
         assert r1["ok"] is True
 
-        # Пытаемся записаться повторно
         r2 = await execute_booking(123, "@u", "U", "аромапсихолог", "14:10")
-        assert r2["ok"] is False  # уже записан
+        assert r2["ok"] is False
 
-        # Отменяем вручную (имитируем)
         bot_module._sheet_cache["аромапсихолог"] = [
             r for r in bot_module._sheet_cache["аромапсихолог"]
             if str(r.get("ID", "")) != "123"
         ]
 
-        # Записываемся снова
         r3 = await execute_booking(123, "@u", "U", "аромапсихолог", "14:20")
         assert r3["ok"] is True
 
     async def test_reschedule_flow(self):
-        """Запись → перенос на другое время."""
         bot_module._sheet_cache = {"массаж": []}
-
         r1 = await execute_booking(123, "@u", "U", "массаж", "11:00")
         assert r1["ok"] is True
 
@@ -1519,15 +1913,12 @@ class TestFullScenarios:
         assert r2["ok"] is True
         assert "12:00" in r2["text"]
 
-        # Старого слота нет
         bookings = get_all_user_bookings("123")
         assert all(b["time"] == "12:00" for b in bookings if b["event"] == "массаж")
 
     async def test_multi_event_day(self):
-        """Пользователь записывается на всё что можно."""
         bot_module._sheet_cache = {ev: [] for ev in EVENTS_CONFIG}
 
-        results = []
         bookings_plan = [
             ("макияж", "10:00"),
             ("массаж", "11:00"),
@@ -1537,14 +1928,12 @@ class TestFullScenarios:
         ]
         for ev, t in bookings_plan:
             r = await execute_booking(123, "@u", "U", ev, t)
-            results.append(r)
+            assert r["ok"] is True
 
-        assert all(r["ok"] for r in results)
         all_bookings = get_all_user_bookings("123")
         assert len(all_bookings) == 5
 
     async def test_multi_event_with_conflict(self):
-        """Конфликт: нутрициолог 15:00 (90 мин) и мастерская 16:00 (60 мин)."""
         bot_module._sheet_cache = {ev: [] for ev in EVENTS_CONFIG}
 
         r1 = await execute_booking(123, "@u", "U", "нутрициолог", "15:00")
@@ -1552,33 +1941,54 @@ class TestFullScenarios:
 
         r2 = await execute_booking(123, "@u", "U", "мастерская чехова", "16:00")
         assert r2["ok"] is False
-        assert "накладочка" in r2["text"]
+        # UPDATED: «накладочка» → «накладка»
+        assert "накладка" in r2["text"].lower()
 
-        # Но 11:00 — OK
         r3 = await execute_booking(123, "@u", "U", "мастерская чехова", "11:00")
         assert r3["ok"] is True
 
     async def test_gadалки_two_users_same_time(self):
-        """Два человека к двум гадалкам в одно время."""
         bot_module._sheet_cache = {"гадалки": []}
-
         r1 = await execute_booking(100, "@a", "A", "гадалки", "11:00")
         assert r1["ok"] is True
-
         r2 = await execute_booking(200, "@b", "B", "гадалки", "11:00")
         assert r2["ok"] is True
-
-        # 3-й не должен пройти
         r3 = await execute_booking(300, "@c", "C", "гадалки", "11:00")
         assert r3["ok"] is False
 
     async def test_chekhov_capacity_10(self):
-        """Мастерская: 10 мест на слот."""
         bot_module._sheet_cache = {"мастерская чехова": []}
-
         for i in range(10):
             r = await execute_booking(100 + i, f"@u{i}", f"U{i}", "мастерская чехова", "14:00")
             assert r["ok"] is True
-
         r = await execute_booking(999, "@last", "Last", "мастерская чехова", "14:00")
         assert r["ok"] is False
+
+    async def test_full_flow_with_callbacks(self):
+        """E2E: start → выбрать услугу → выбрать слот → подтверждение → программа."""
+        bot_module._sheet_cache = {ev: [] for ev in EVENTS_CONFIG}
+
+        # 1. /start
+        msg = _make_message("/start")
+        state = _make_state()
+        await bot_module.cmd_start(msg, state)
+        kb = msg.reply.call_args.kwargs.get("reply_markup")
+        assert kb is not None
+
+        # 2. Тап на услугу
+        cb = _make_callback("start_book|массаж")
+        state = _make_state()
+        await bot_module.process_start_book(cb, state)
+        state.set_state.assert_called_with(BookingState.waiting_for_time)
+
+        # 3. Тап на слот
+        cb2 = _make_callback("slot|массаж|11:00|book")
+        state2 = _make_state(data={"action": "book", "event": "массаж"})
+        await bot_module.process_slot(cb2, state2)
+        last_text = cb2.message.edit_text.call_args_list[-1][0][0]
+        assert "записано" in last_text.lower() or "Записано" in last_text
+
+        # 4. Проверяем запись
+        bookings = get_all_user_bookings("123")
+        assert len(bookings) == 1
+        assert bookings[0]["event"] == "массаж"
