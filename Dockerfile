@@ -12,10 +12,11 @@ RUN apt-get update && apt-get install -y tzdata && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код бота
-COPY bot.py .
-COPY .env .
-COPY google_creds.json .
+# Копируем весь исходный код проекта в контейнер
+COPY . .
 
-# Запускаем бота
-CMD ["python", "bot.py"]
+# Открываем порт для Health-check сервера (по умолчанию 8080)
+EXPOSE 8080
+
+# Запускаем бота через новый входной файл
+CMD ["python", "main.py"]
