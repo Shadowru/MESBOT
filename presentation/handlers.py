@@ -26,6 +26,14 @@ WELCOME_TEXT = (
     "Или выберите услугу из списка 👇"
 )
 
+def make_cb(prefix: str, *args) -> str:
+    # Собираем строку
+    data = f"{prefix}|{'|'.join(map(str, args))}"
+    if len(data.encode('utf-8')) > 64:
+        # Если слишком длинно, можно логировать ошибку или обрезать (но лучше сократить данные)
+        print(f"WARNING: Callback data too long ({len(data)} bytes): {data}")
+    return data
+
 def _resolve_event(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -42,7 +50,7 @@ async def handle_booking_result(callback: types.CallbackQuery, res: dict, event:
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Записаться всё равно", 
-                                  callback_data=f"confirm_overlap|{event}|{time_str}|{m_id}|{action}")],
+                                  callback_data=make_cb("c_ov", event, time_str, m_id, action))],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_services")]
         ])
         return await callback.message.edit_text(
@@ -240,7 +248,7 @@ async def process_start_book(callback: types.CallbackQuery, booking_service: Boo
         return await callback.message.edit_text("К сожалению, мест больше нет 😔", reply_markup=kb)
         
     card = build_service_card(event, suggested)
-    await callback.message.edit_text(card + "\n\n🕐 **Выберите время:**", reply_markup=build_slot_keyboard(event, suggested))
+    await callback.message.edit_text(card + "\n\n🕐 **Выберите время:**", reply_markup=build_slot_keyboard(event, suggested, action="book"))
 
 @router.callback_query(F.data.startswith("slot|"))
 async def process_slot(callback: types.CallbackQuery, booking_service: BookingService):
@@ -374,7 +382,7 @@ async def process_master_selection(callback: types.CallbackQuery, booking_servic
     )
     await handle_booking_result(callback, res, event, time_str, master_id, action)
     
-@router.callback_query(F.data.startswith("confirm_overlap|"))
+@router.callback_query(F.data.startswith("c_ov|"))
 async def process_confirm_overlap(callback: types.CallbackQuery, booking_service: BookingService):
     # Данные: confirm_overlap|event|time|master_id|action
     _, event, time_str, master_id, action = callback.data.split("|")
@@ -391,3 +399,36 @@ async def process_confirm_overlap(callback: types.CallbackQuery, booking_service
         force=True
     )
     await callback.message.edit_text(res["text"], parse_mode="Markdown")
+    
+@router.callback_query(F.data.startswith("hour|"))
+async def process_hour_selection(callback: types.CallbackQuery, booking_service: BookingService):
+    _, event, hour, action = callback.data.split("|")
+    
+    # Получаем все доступные слоты заново
+    slots = await booking_service.get_suggested_slots(event, top_n=100)
+    
+    print(slots.count)
+    print(slots)
+    
+    # Строим клавиатуру для конкретного часа
+    kb = build_slot_keyboard(event, slots, action, selected_hour=hour)
+    
+    await callback.message.edit_text(
+        f"🕐 Выберите время для услуги **{event}** ({hour}):", 
+        reply_markup=kb, 
+        parse_mode="Markdown"
+    )
+
+# 2. Обработка кнопки "Назад"
+@router.callback_query(F.data.startswith("back_to_hours|"))
+async def process_back_to_hours(callback: types.CallbackQuery, booking_service: BookingService):
+    _, event, action = callback.data.split("|")
+    
+    slots = await booking_service.get_suggested_slots(event, top_n=100)
+    kb = build_slot_keyboard(event, slots, action)
+    
+    await callback.message.edit_text(
+        f"🕐 Выберите час для услуги **{event}**:", 
+        reply_markup=kb, 
+        parse_mode="Markdown"
+    )

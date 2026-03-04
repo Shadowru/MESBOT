@@ -38,7 +38,7 @@ class BookingService:
             bookings.extend([r for r in records if r.user_id == user_id])
         return bookings
 
-    async def get_suggested_slots(self, event: str, top_n: int = 6) -> List[Tuple[str, int]]:
+    async def get_suggested_slots(self, event: str, top_n: int = 100) -> List[Tuple[str, int]]:
         records = await self.repo.get_records(event)
         slots = []
         for s in self.get_slot_list(event):

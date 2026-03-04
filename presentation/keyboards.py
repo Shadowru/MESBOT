@@ -6,7 +6,9 @@ from collections import defaultdict
 def group_slots_by_hour(slots):
     groups = defaultdict(list)
     for s in slots:
-        hour = s.split(':')[0] + ":00"
+        # Если s — это кортеж (время, кол-во), берем первый элемент
+        time_str = s[0] if isinstance(s, (tuple, list)) else s
+        hour = time_str.split(':')[0] + ":00"
         groups[hour].append(s)
     return dict(sorted(groups.items()))
 
@@ -34,12 +36,50 @@ async def build_services_keyboard(user_id: str, booking_service: BookingService)
                 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def build_slot_keyboard(event: str, suggested: list, action: str = "book") -> InlineKeyboardMarkup:
-    buttons = []
-    for t, a in suggested:
-        buttons.append([InlineKeyboardButton(text=f"🕐 {t}  ·  свободно: {a}", callback_data=f"slot|{event}|{t}|{action}")])
-    buttons.append([InlineKeyboardButton(text="← Назад к услугам", callback_data="back_to_services")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def build_slot_keyboard(event, slots, action="book", selected_hour=None):
+    kb = []
+    grouped = group_slots_by_hour(slots) # Сначала группируем
+    
+    print(slots.count)
+    print(slots)
+    
+    # Если мы внутри часа (selected_hour есть) - показываем слоты
+    if selected_hour:
+        hour_slots = [s for s in slots if (s[0] if isinstance(s, (tuple, list)) else s).startswith(selected_hour.split(':')[0])]
+        
+        row = []
+        for s in hour_slots:
+            time_str = s[0] if isinstance(s, (tuple, list)) else s
+            row.append(InlineKeyboardButton(text=time_str, callback_data=f"slot|{event}|{time_str}|{action}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row: kb.append(row)
+        
+        kb.append([InlineKeyboardButton(text="⬅️ Назад к часам", callback_data=f"back_to_hours|{event}|{action}")])
+        
+    # НОВАЯ ЛОГИКА: Если часов больше одного - показываем часы
+    elif len(grouped) > 1:
+        row = []
+        for hour in grouped.keys():
+            row.append(InlineKeyboardButton(text=hour, callback_data=f"hour|{event}|{hour}|{action}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row: kb.append(row)
+        
+    # Если час всего один - показываем сразу все слоты
+    else:
+        row = []
+        for s in slots:
+            time_str = s[0] if isinstance(s, (tuple, list)) else s
+            row.append(InlineKeyboardButton(text=time_str, callback_data=f"slot|{event}|{time_str}|{action}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row: kb.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def build_masters_keyboard(event: str, time_str: str, masters: list, action: str = "book"):
     kb = []
