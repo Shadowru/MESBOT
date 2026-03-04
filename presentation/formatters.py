@@ -12,12 +12,19 @@ def build_service_card(event: str, available_slots: list) -> str:
     
     total_available = sum(a for t, a in available_slots)
     
+    #lines = [
+    #    f"{icon} **{ef(event)}**",
+    #    f"_{desc}_", "",
+    #    f"🕐 {cfg['start']} — {cfg['end']}  ·  ⏱ {cfg['duration']} мин",
+    #    f"📊 Свободно мест: {total_available}" if total_available else "⛔ Свободных мест нет"
+    #]
+
     lines = [
         f"{icon} **{ef(event)}**",
         f"_{desc}_", "",
-        f"🕐 {cfg['start']} — {cfg['end']}  ·  ⏱ {cfg['duration']} мин",
-        f"📊 Свободно мест: {total_available}" if total_available else "⛔ Свободных мест нет"
+        f"🕐 {cfg['start']} — {cfg['end']}  ·  ⏱ {cfg['duration']} мин"
     ]
+
     return "\n".join(lines)
 
 def build_program_message(bookings: List[BookingRecord]) -> str | None:
