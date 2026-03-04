@@ -6,8 +6,10 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from services.booking_service import BookingService
 from core.interfaces import ILLMService
 from core.config import EVENTS_CONFIG, EVENT_ALIASES
-from presentation.keyboards import build_services_keyboard, build_slot_keyboard
+from core.config import MASTERS_CONFIG
+from presentation.keyboards import build_services_keyboard, build_slot_keyboard, build_masters_keyboard
 from presentation.formatters import build_service_card, build_program_message, ef
+from presentation.keyboards import build_services_keyboard, build_slot_keyboard, get_main_menu_keyboard
 
 router = Router()
 
@@ -31,18 +33,52 @@ def _resolve_event(raw: str | None) -> str | None:
     key = EVENT_ALIASES.get(key, key)
     return key if key in EVENTS_CONFIG else None
 
+async def handle_booking_result(callback: types.CallbackQuery, res: dict, event: str, time_str: str, master_id: str, action: str):
+    # Если произошел конфликт по времени
+    if not res.get("ok") and res.get("status") == "conflict":
+        conflict_event = res["conflict_event"]
+        # Если master_id None, превращаем в строку для callback_data
+        m_id = master_id if master_id else "None"
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Записаться всё равно", 
+                                  callback_data=f"confirm_overlap|{event}|{time_str}|{m_id}|{action}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_services")]
+        ])
+        return await callback.message.edit_text(
+            f"⚠️ **Внимание!** У вас уже есть запись на *{conflict_event}* в {time_str}.\n\n"
+            "Вы уверены, что хотите записаться на эту активность тоже?", 
+            reply_markup=kb, parse_mode="Markdown"
+        )
+    
+    # Если всё ок или другая ошибка (например, "Мест нет")
+    await callback.message.edit_text(res["text"], parse_mode="Markdown")
+
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, booking_service: BookingService):
     user_id = str(message.from_user.id)
     kb = await build_services_keyboard(user_id, booking_service)
-    await message.reply(WELCOME_TEXT, reply_markup=kb, parse_mode="Markdown")
+    
+    # Отправляем приветствие с Inline-кнопками и Reply-клавиатуру
+    await message.reply(
+        WELCOME_TEXT, 
+        reply_markup=kb, 
+        parse_mode="Markdown"
+    )
+    # Отправляем сообщение с Reply-клавиатурой (она закрепится внизу)
+    await message.answer("Используйте кнопки меню для навигации:", reply_markup=get_main_menu_keyboard())
+
+@router.message(F.text == "Все услуги")
+async def handle_all_activities(message: types.Message, booking_service: BookingService):
+    user_id = str(message.from_user.id)
+    kb = await build_services_keyboard(user_id, booking_service)
+    await message.answer("✨ **Доступные услуги для записи:**", reply_markup=kb, parse_mode="Markdown")
 
 @router.message()
 async def handle_text(message: types.Message, llm: ILLMService, booking_service: BookingService):
     text_lower = message.text.lower().strip()
     user_id = str(message.from_user.id)
 
-    # 1. Быстрые команды без LLM
 # 1. Быстрые команды без LLM
     if text_lower in ["моя программа", "мои записи", "расписание", "программа"]:
         bookings = await booking_service.get_user_bookings(user_id)
@@ -158,8 +194,33 @@ async def handle_text(message: types.Message, llm: ILLMService, booking_service:
         time_str=time_str,
         is_reschedule=(action == "reschedule")
     )
-    await processing_msg.edit_text(res["text"], parse_mode="Markdown")
+        # 1. Если конфликт (пересечение времени)
+    if not res.get("ok") and res.get("status") == "conflict":
+        conflict_event = res["conflict_event"]
+        # Здесь мы не можем использовать Inline-кнопки "Записаться всё равно", 
+        # так как это обычное текстовое сообщение, а не callback.
+        # Поэтому просто сообщаем о конфликте:
+        return await processing_msg.edit_text(
+            f"⚠️ **Внимание!** У вас уже есть запись на *{conflict_event}* в {time_str}.\n"
+            "Пожалуйста, сначала отмените текущую запись или выберите другое время.",
+            parse_mode="Markdown"
+        )
+        
+    if not res.get("ok") and res.get("text") == "invalid_time":
+        suggested = await booking_service.get_suggested_slots(event)
+        if suggested:
+            card = build_service_card(event, suggested)
+            kb = build_slot_keyboard(event, suggested, action)
+            return await processing_msg.edit_text(
+                f"К сожалению, время {time_str} недоступно.\n\n" + card + "\n\n🕐 **Выберите доступное время:**", 
+                reply_markup=kb, 
+                parse_mode="Markdown"
+            )
+        return await processing_msg.edit_text(f"Время {time_str} недоступно, мест нет 😔", parse_mode="Markdown")
 
+        # Если другая ошибка (например, "Все мастера заняты")
+    
+    await processing_msg.edit_text(res["text"], parse_mode="Markdown")
 
 # --- Обработчики кнопок (Inline Callbacks) ---
 
@@ -188,8 +249,27 @@ async def process_slot(callback: types.CallbackQuery, booking_service: BookingSe
     time_str = parts[2]
     action = parts[3] if len(parts) > 3 else "book"
     
+    if event == "салон предчувствий":
+        records = await booking_service.repo.get_records(event)
+        at_time = [r for r in records if r.time == time_str]
+        busy_ids = [r.master_id for r in at_time]
+        
+        # Получаем список доступных мастеров
+        available = [m for m in MASTERS_CONFIG[event] if m["id"] not in busy_ids]
+        
+        if not available:
+            return await callback.answer("Все специалисты заняты на это время.", show_alert=True)
+            
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            # Передаем индекс i вместо длинного ID
+            [InlineKeyboardButton(text=m["name"], callback_data=f"master|{event}|{time_str}|{i}|{action}")]
+            for i, m in enumerate(available)
+        ] + [[InlineKeyboardButton(text="← Назад", callback_data="back_to_services")]])
+        
+        return await callback.message.edit_text(f"🔮 **Выберите специалиста на {time_str}:**", reply_markup=kb)
+
+    # Для остальных услуг
     await callback.message.edit_text(f"⏳ Записываю {ef(event, 'to')} на {time_str}…")
-    
     res = await booking_service.execute_booking(
         user_id=str(callback.from_user.id),
         username=callback.from_user.username or "",
@@ -198,8 +278,8 @@ async def process_slot(callback: types.CallbackQuery, booking_service: BookingSe
         time_str=time_str,
         is_reschedule=(action == "reschedule")
     )
-    await callback.message.edit_text(res["text"], parse_mode="Markdown")
-
+    await handle_booking_result(callback, res, event, time_str, None, action)
+    
 @router.callback_query(F.data == "back_to_services")
 async def process_back_to_services(callback: types.CallbackQuery, booking_service: BookingService):
     user_id = str(callback.from_user.id)
@@ -214,31 +294,31 @@ async def process_no_slots(callback: types.CallbackQuery):
 async def process_my_booking_detail(callback: types.CallbackQuery, booking_service: BookingService):
     event = callback.data.split("|")[1]
     user_id = str(callback.from_user.id)
-    
-    # Ищем конкретную запись пользователя
     bookings = await booking_service.get_user_bookings(user_id)
     booking = next((b for b in bookings if b.event == event), None)
     
     if not booking:
-        await callback.answer("Запись не найдена 😔", show_alert=True)
-        kb = await build_services_keyboard(user_id, booking_service)
-        return await callback.message.edit_text("✨ **Выберите услугу:**", reply_markup=kb, parse_mode="Markdown")
-        
-    # Формируем текст с деталями записи
+        return await callback.answer("Запись не найдена")
+
+    # Поиск локации
+    location = "Не указана"
+    if event in MASTERS_CONFIG and booking.master_id != "Записано":
+        master = next((m for m in MASTERS_CONFIG[event] if m["id"] == booking.master_id), None)
+        if master: location = master.get("location", "Не указана")
+    
     text = (
         f"✅ **Вы записаны на {ef(event)}**\n\n"
         f"🕐 **Время:** {booking.time}\n"
+        f"📍 **Локация:** {location}\n"
     )
     if booking.master_id and booking.master_id != "Записано":
         text += f"👤 **Специалист:** {booking.master_id}\n"
         
-    # Клавиатура с кнопками переноса, отмены и возврата назад
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Перенести время", callback_data=f"request_reschedule|{event}")],
         [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_booking|{event}")],
         [InlineKeyboardButton(text="← Назад к услугам", callback_data="back_to_services")]
     ])
-    
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
 
 
@@ -273,4 +353,41 @@ async def process_request_reschedule(callback: types.CallbackQuery, booking_serv
         card + "\n\n🔄 **Выберите новое время для переноса:**", 
         reply_markup=kb, 
         parse_mode="Markdown"
-    )    
+    )
+    
+@router.callback_query(F.data.startswith("master|"))
+async def process_master_selection(callback: types.CallbackQuery, booking_service: BookingService):
+    _, event, time_str, master_idx, action = callback.data.split("|")
+    
+    # Получаем мастера из конфига по индексу
+    master = MASTERS_CONFIG[event][int(master_idx)]
+    master_id = master["id"]
+    
+    res = await booking_service.execute_booking(
+        user_id=str(callback.from_user.id),
+        username=callback.from_user.username or "",
+        full_name=callback.from_user.full_name,
+        event=event,
+        time_str=time_str,
+        is_reschedule=(action == "reschedule"),
+        master_id=master_id
+    )
+    await handle_booking_result(callback, res, event, time_str, master_id, action)
+    
+@router.callback_query(F.data.startswith("confirm_overlap|"))
+async def process_confirm_overlap(callback: types.CallbackQuery, booking_service: BookingService):
+    # Данные: confirm_overlap|event|time|master_id|action
+    _, event, time_str, master_id, action = callback.data.split("|")
+    
+    # Вызываем запись с force=True
+    res = await booking_service.execute_booking(
+        user_id=str(callback.from_user.id),
+        username=callback.from_user.username or "",
+        full_name=callback.from_user.full_name,
+        event=event,
+        time_str=time_str,
+        is_reschedule=(action == "reschedule"),
+        master_id=master_id if master_id != "None" else None,
+        force=True
+    )
+    await callback.message.edit_text(res["text"], parse_mode="Markdown")

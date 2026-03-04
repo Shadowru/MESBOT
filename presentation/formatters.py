@@ -1,9 +1,9 @@
-from core.config import EVENTS_CONFIG, EVENT_ICONS, SERVICE_DESCRIPTIONS, EVENT_FORMS
+from core.config import EVENTS_CONFIG, EVENT_ICONS, SERVICE_DESCRIPTIONS, EVENT_FORMS, MASTERS_CONFIG
 from core.models import BookingRecord
 from typing import List
 
-def ef(event: str, form: str = "title") -> str:
-    return EVENT_FORMS.get(event, {}).get(form, event.capitalize())
+def ef(event, case="title"):
+    return EVENT_FORMS.get(event, {}).get(case, event)
 
 def build_service_card(event: str, available_slots: list) -> str:
     cfg = EVENTS_CONFIG[event]
@@ -27,25 +27,37 @@ def build_service_card(event: str, available_slots: list) -> str:
 
     return "\n".join(lines)
 
-def build_program_message(bookings: List[BookingRecord]) -> str | None:
+def build_program_message(bookings) -> str:
     if not bookings:
-        return None
+        return ""
+    
+    text = "📅 **Ваша программа на сегодня:**\n\n"
+    
+    # Сортируем записи по времени
+    sorted_bookings = sorted(bookings, key=lambda x: x.time)
+    
+    for b in sorted_bookings:
+        # Получаем красивое название услуги
+        title = EVENT_FORMS.get(b.event, {}).get("title", b.event)
         
-    bookings.sort(key=lambda b: b.time)
-    total_events = len(EVENTS_CONFIG)
-    booked_count = len(bookings)
-    progress = "●" * booked_count + "○" * (total_events - booked_count)
-
-    lines = [
-        f"📋 **Ваша бьюти-программа**",
-        f"  {progress}  {booked_count} из {total_events}",
-        ""
-    ]
-
-    for b in bookings:
-        icon = EVENT_ICONS.get(b.event, "✨")
-        lines.append(f"  {icon}  **{b.time}**  │  {ef(b.event)}")
+        # Пытаемся найти локацию
+        location = "Не указана"
+        
+        # Если есть мастер, ищем его локацию в MASTERS_CONFIG
         if b.master_id and b.master_id != "Записано":
-            lines.append(f"        ↳ _Специалист: {b.master_id}_")
-
-    return "\n".join(lines)
+            masters = MASTERS_CONFIG.get(b.event, [])
+            master = next((m for m in masters if m["id"] == b.master_id), None)
+            if master:
+                location = master.get("location", "Не указана")
+        
+        # Если локация всё еще "Не указана", можно попробовать взять дефолтную из конфига, 
+        # если бы она там была, но пока берем из мастера.
+        
+        text += (
+            f"• **{title}**\n"
+            f"  🕐 Время: {b.time}\n"
+            f"  📍 Место: {location}\n"
+            f"  👤 Мастер: {b.master_id if b.master_id != 'Записано' else 'Любой'}\n\n"
+        )
+        
+    return text
