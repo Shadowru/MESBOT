@@ -116,7 +116,30 @@ async def handle_text(message: types.Message, llm: ILLMService, booking_service:
     time_str = time_str.strip() if time_str else ""
     is_valid_time = bool(re.match(r"^\d{1,2}:\d{2}$", time_str))
 
-    # Если action == "book" или "reschedule"
+    # Проверяем, записан ли уже пользователь на эту услугу
+    if action in ["book", "reschedule"]:
+        bookings = await booking_service.get_user_bookings(user_id)
+        existing_booking = next((b for b in bookings if b.event == event), None)
+
+        # Если человек просто просит записать (book), но уже записан:
+        if existing_booking and action == "book":
+            text = (
+                f"Вы уже записаны {ef(event, 'to')} ✅\n\n"
+                f"🕐 **Ваше время:** {existing_booking.time}\n"
+            )
+            if existing_booking.master_id and existing_booking.master_id != "Записано":
+                text += f"👤 **Специалист:** {existing_booking.master_id}\n"
+            
+            text += "\nЧто бы вы хотели сделать?"
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Перенести время", callback_data=f"request_reschedule|{event}")],
+                [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_booking|{event}")],
+                [InlineKeyboardButton(text="← Назад к услугам", callback_data="back_to_services")]
+            ])
+            return await processing_msg.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+    # Если action == "book" или "reschedule" (и мы прошли проверку выше)
     if not is_valid_time:
         # Если время не указано (или LLM вернула заглушку типа "HH:MM"), показываем слоты
         suggested = await booking_service.get_suggested_slots(event)
@@ -209,8 +232,9 @@ async def process_my_booking_detail(callback: types.CallbackQuery, booking_servi
     if booking.master_id and booking.master_id != "Записано":
         text += f"👤 **Специалист:** {booking.master_id}\n"
         
-    # Клавиатура с кнопкой отмены и возврата назад
+    # Клавиатура с кнопками переноса, отмены и возврата назад
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Перенести время", callback_data=f"request_reschedule|{event}")],
         [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cancel_booking|{event}")],
         [InlineKeyboardButton(text="← Назад к услугам", callback_data="back_to_services")]
     ])
@@ -229,3 +253,24 @@ async def process_cancel_booking_inline(callback: types.CallbackQuery, booking_s
     # Возвращаем главное меню с обновленными статусами
     kb = await build_services_keyboard(user_id, booking_service)
     await callback.message.edit_text(f"{res}\n\n✨ **Выберите услугу:**", reply_markup=kb, parse_mode="Markdown")    
+    
+@router.callback_query(F.data.startswith("request_reschedule|"))
+async def process_request_reschedule(callback: types.CallbackQuery, booking_service: BookingService):
+    event = callback.data.split("|")[1]
+    
+    # Получаем свободные слоты
+    suggested = await booking_service.get_suggested_slots(event)
+    if not suggested:
+        return await callback.answer("К сожалению, других свободных мест нет 😔", show_alert=True)
+        
+    card = build_service_card(event, suggested)
+    
+    # Генерируем клавиатуру слотов, передавая action="reschedule"
+    # Это скажет боту, что при выборе времени старую запись нужно удалить
+    kb = build_slot_keyboard(event, suggested, action="reschedule")
+    
+    await callback.message.edit_text(
+        card + "\n\n🔄 **Выберите новое время для переноса:**", 
+        reply_markup=kb, 
+        parse_mode="Markdown"
+    )    
