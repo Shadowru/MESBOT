@@ -12,7 +12,7 @@ SYNC_STALE_MINUTES = int(os.environ.get("SYNC_STALE_MINUTES", "10"))
 
 EVENTS_CONFIG = {
     "аромапсихолог": {"sheet": "Аромапсихолог", "duration": 10, "capacity": 1, "start": "14:00", "end": "17:00"},
-    "макияж": {"sheet": "Макияж", "duration": 10, "capacity": 4, "start": "10:00", "end": "12:00"},
+    "макияж": {"sheet": "Макияж", "duration": 15, "capacity": 5, "start": "10:00", "end": "12:00"},
     "нутрициолог": {"sheet": "Нутрициолог", "duration": 90, "capacity": 30, "start": "15:00", "end": "16:30", "fixed_time": "15:00"},
     "массаж": {"sheet": "Массаж", "duration": 10, "capacity": 3, "start": "11:00", "end": "17:10"},
     "салон предчувствий": {"sheet": "Гадалки", "duration": 15, "capacity": 2, "start": "11:00", "end": "17:00"},
