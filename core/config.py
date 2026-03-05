@@ -17,7 +17,6 @@ EVENTS_CONFIG = {
     "массаж": {"sheet": "Массаж", "duration": 10, "capacity": 3, "start": "11:00", "end": "17:10"},
     "салон предчувствий": {"sheet": "Гадалки", "duration": 15, "capacity": 2, "start": "11:00", "end": "17:00"},
     "мастерская Чехова": {"sheet": "Мастерская Чехова", "duration": 60, "capacity": 10, "start": "11:00", "end": "17:00", "custom_slots": ["11:00", "12:00", "14:00", "15:00", "16:00"]},
-    "семейный нутрициолог": {"sheet": "Семейный нутрициолог", "duration": 90, "capacity": 30, "start": "15:00", "end": "16:30", "fixed_time": "15:00"},
 }
 
 MASTERS_CONFIG = {
