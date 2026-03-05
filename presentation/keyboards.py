@@ -40,8 +40,8 @@ def build_slot_keyboard(event, slots, action="book", selected_hour=None):
     kb = []
     grouped = group_slots_by_hour(slots) # Сначала группируем
     
-    print(slots.count)
-    print(slots)
+    #print(slots.count)
+    #print(slots)
     
     # Если мы внутри часа (selected_hour есть) - показываем слоты
     if selected_hour:

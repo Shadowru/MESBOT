@@ -10,6 +10,17 @@ from services.booking_service import BookingService
 from presentation.handlers import router
 from web.health import HealthServer
 
+#async def run_sync_loop(repo: GoogleSheetsRepository, interval: int = 60):
+#    """Фоновая задача для сброса данных в Sheets"""
+#    while True:
+#        await asyncio.sleep(interval)
+#        try:
+#            logging.info("Начинаю пакетную выгрузку данных в Google Sheets...")
+#            await repo.flush_to_sheets()
+#            logging.info("Выгрузка завершена.")
+#        except Exception as e:
+#            logging.error(f"Ошибка при выгрузке в Sheets: {e}")
+
 async def main():
     logging.basicConfig(level=logging.INFO)
 
@@ -22,6 +33,9 @@ async def main():
 
     # 3. Первичная синхронизация и запуск фоновых задач
     await repo.sync()
+
+    #asyncio.create_task(run_sync_loop(repo, interval=20)) # 60 секунд
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(repo.sync, "interval", minutes=2)
     scheduler.start()

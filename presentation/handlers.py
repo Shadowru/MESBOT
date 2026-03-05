@@ -407,8 +407,8 @@ async def process_hour_selection(callback: types.CallbackQuery, booking_service:
     # Получаем все доступные слоты заново
     slots = await booking_service.get_suggested_slots(event, top_n=100)
     
-    print(slots.count)
-    print(slots)
+    #print(slots.count)
+    #print(slots)
     
     # Строим клавиатуру для конкретного часа
     kb = build_slot_keyboard(event, slots, action, selected_hour=hour)

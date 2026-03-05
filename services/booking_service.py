@@ -10,6 +10,7 @@ class BookingService:
     def __init__(self, repo: IBookingRepository):
         self.repo = repo
         self._user_locks: Dict[str, asyncio.Lock] = {}
+        self.global_lock = asyncio.Lock() # Глобальная блокировка
 
     def _get_user_lock(self, user_id: str) -> asyncio.Lock:
         if user_id not in self._user_locks:
@@ -79,62 +80,63 @@ class BookingService:
             return {"ok": False, "text": "invalid_time"}
         # ----------------------
         
-        async with self._get_user_lock(user_id):
+        async with self.global_lock:
+            async with self._get_user_lock(user_id):
             
-            # 2. НОВАЯ ПРОВЕРКА: Проверка на пересечение времени с другими активностями
-                        # Проверка на пересечение (только если не принудительное подтверждение)
-            if not force:
-                all_user_bookings = await self.get_user_bookings(user_id)
-                for b in all_user_bookings:
-                    if b.time == time_str:
-                        # Если это перенос, игнорируем старую запись
-                        if is_reschedule and b.event == event:
-                            continue
-                        # Возвращаем статус конфликта
-                        return {
+                # 2. НОВАЯ ПРОВЕРКА: Проверка на пересечение времени с другими активностями
+                # Проверка на пересечение (только если не принудительное подтверждение)
+                if not force:
+                    all_user_bookings = await self.get_user_bookings(user_id)
+                    for b in all_user_bookings:
+                        if b.time == time_str:
+                            # Если это перенос, игнорируем старую запись
+                            if is_reschedule and b.event == event:
+                                continue
+                            # Возвращаем статус конфликта
+                            return {
                             "ok": False, 
                             "status": "conflict", 
                             "conflict_event": b.event,
                             "text": f"Конфликт времени с {b.event}" 
-                        }
+                            }
             
-            records = await self.repo.get_records(event)
+                records = await self.repo.get_records(event)
             
-            if is_reschedule:
-                await self.repo.delete_record(event, user_id)
-            elif any(r.user_id == user_id for r in records):
-                return {"ok": False, "text": "Вы уже записаны на эту услугу."}
+                if is_reschedule:
+                    await self.repo.delete_record(event, user_id)
+                elif any(r.user_id == user_id for r in records):
+                    return {"ok": False, "text": "Вы уже записаны на эту услугу."}
 
             # Логика выбора мастера
-            final_master_id = "Записано"
+                final_master_id = "Записано"
             
-            if event in MASTERS_CONFIG:
-                at_time = [r for r in records if r.time == time_str]
-                busy_ids = [r.master_id for r in at_time]
-                available_masters = [
-                    m for m in MASTERS_CONFIG[event] 
-                    if time_str not in m.get("breaks", []) and m["id"] not in busy_ids
-                ]
+                if event in MASTERS_CONFIG:
+                    at_time = [r for r in records if r.time == time_str]
+                    busy_ids = [r.master_id for r in at_time]
+                    available_masters = [
+                        m for m in MASTERS_CONFIG[event] 
+                        if time_str not in m.get("breaks", []) and m["id"] not in busy_ids
+                    ]
                 
-                if not available_masters:
-                    return {"ok": False, "text": "Все мастера заняты на это время."}
+                    if not available_masters:
+                        return {"ok": False, "text": "Все мастера заняты на это время."}
 
-                # Если передан конкретный мастер (для гадалок)
-                if master_id:
-                    selected_master = next((m for m in available_masters if m["id"] == master_id), None)
-                    if not selected_master:
-                        return {"ok": False, "text": "Этот специалист уже занят."}
-                    final_master_id = selected_master["id"]
-                else:
-                    # Случайный выбор для остальных
-                    final_master_id = random.choice(available_masters)["id"]
+                    # Если передан конкретный мастер (для гадалок)
+                    if master_id:
+                        selected_master = next((m for m in available_masters if m["id"] == master_id), None)
+                        if not selected_master:
+                            return {"ok": False, "text": "Этот специалист уже занят."}
+                        final_master_id = selected_master["id"]
+                    else:
+                        # Случайный выбор для остальных
+                        final_master_id = random.choice(available_masters)["id"]
 
-            elif event in EVENTS_CONFIG and len([r for r in records if r.time == time_str]) >= EVENTS_CONFIG[event]["capacity"]:
-                return {"ok": False, "text": "Мест нет."}
+                elif event in EVENTS_CONFIG and len([r for r in records if r.time == time_str]) >= EVENTS_CONFIG[event]["capacity"]:
+                    return {"ok": False, "text": "Мест нет."}
 
-            record = BookingRecord(user_id, username, full_name, event, time_str, final_master_id)
-            await self.repo.add_record(record)
-            return {"ok": True, "text": f"✅ Записано! {'Специалист: ' + final_master_id if final_master_id != 'Записано' else ''}"}
+                record = BookingRecord(user_id, username, full_name, event, time_str, final_master_id)
+                await self.repo.add_record(record)
+                return {"ok": True, "text": f"✅ Записано! {'Специалист: ' + final_master_id if final_master_id != 'Записано' else ''}"}
         
         
     async def cancel_all(self, user_id: str) -> str:
